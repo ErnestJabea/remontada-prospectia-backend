@@ -4,13 +4,13 @@ const pool = require('../db');
 const JWT_SECRET = process.env.JWT_SECRET;
 
 /**
- * Accepte le cookie HttpOnly du portail web et conserve le Bearer token
- * pour la compatibilite avec la PWA mobile.
+ * Accepte le Bearer token de la PWA/backoffice tokenise et conserve les
+ * cookies HttpOnly comme fallback pour les deploiements same-site.
  */
 async function authenticate(req, res, next) {
   const authHeader = req.headers.authorization;
   const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  const token = req.cookies?.crm_access || bearerToken;
+  const token = bearerToken || req.cookies?.crm_access;
 
   if (!token) {
     return res.status(401).json({ error: 'Token d\'authentification manquant.' });
