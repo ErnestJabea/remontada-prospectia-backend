@@ -190,7 +190,12 @@ router.post('/login', async (req, res) => {
     await storeRefreshToken(pool, user.id, refreshToken, deviceId || `web-${crypto.randomUUID()}`);
     setWebCookies(res, accessToken, refreshToken);
 
-    return res.json({ user: publicUser(user) });
+    return res.json({
+      user: publicUser(user),
+      token: accessToken,
+      accessToken,
+      refreshToken
+    });
   } catch (err) {
     console.error('[AUTH/LOGIN]', err);
     return res.status(500).json({ error: 'Erreur serveur.' });
