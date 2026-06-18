@@ -14,10 +14,16 @@ for (const requiredSecret of ['JWT_SECRET', 'JWT_REFRESH_SECRET']) {
   }
 }
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+const allowedOrigins = [
+  process.env.ALLOWED_ORIGINS,
+  process.env.FRONTEND_ORIGINS
+]
+  .filter(Boolean)
+  .join(',')
   .split(',')
   .map(origin => origin.trim())
-  .filter(Boolean);
+  .filter(Boolean)
+  .filter((origin, index, origins) => origins.indexOf(origin) === index);
 
 app.disable('x-powered-by');
 app.use(helmet({
