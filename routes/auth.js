@@ -17,10 +17,11 @@ const ACCESS_COOKIE = 'crm_access';
 const REFRESH_COOKIE = 'crm_refresh';
 
 const secureCookies = process.env.NODE_ENV === 'production' || process.env.COOKIE_SECURE === 'true';
+const cookieSameSite = process.env.COOKIE_SAMESITE || (secureCookies ? 'none' : 'lax');
 const baseCookieOptions = {
   httpOnly: true,
   secure: secureCookies,
-  sameSite: 'strict',
+  sameSite: cookieSameSite,
   path: '/'
 };
 
