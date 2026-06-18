@@ -2,6 +2,36 @@ const jwt = require('jsonwebtoken');
 const pool = require('../db');
 
 const JWT_SECRET = process.env.JWT_SECRET;
+const TEMP_SIMPLE_AUTH = process.env.TEMP_SIMPLE_AUTH === 'true';
+
+async function authenticateTemporarily(req, res, next) {
+  const requestedUserId = Number(req.headers['x-crm-user-id'] || 0);
+  if (!requestedUserId) {
+    return res.status(401).json({ error: 'Token d\'authentification manquant.' });
+  }
+
+  const [rows] = await pool.query(
+    `SELECT id, username, full_name, role, is_active
+     FROM users
+     WHERE id = ? AND is_active = TRUE
+     LIMIT 1`,
+    [requestedUserId]
+  );
+
+  if (!rows.length) {
+    return res.status(401).json({ error: 'Utilisateur temporaire invalide ou inactif.' });
+  }
+
+  req.user = {
+    id: rows[0].id,
+    username: rows[0].username,
+    full_name: rows[0].full_name,
+    role: rows[0].role,
+    clientType: 'temporary_backoffice'
+  };
+
+  return next();
+}
 
 /**
  * Accepte le cookie HttpOnly du portail web et conserve le Bearer token
@@ -13,6 +43,7 @@ async function authenticate(req, res, next) {
   const token = req.cookies?.crm_access || bearerToken;
 
   if (!token) {
+    if (TEMP_SIMPLE_AUTH) return authenticateTemporarily(req, res, next);
     return res.status(401).json({ error: 'Token d\'authentification manquant.' });
   }
 
@@ -61,6 +92,7 @@ async function authenticate(req, res, next) {
 
     next();
   } catch (err) {
+    if (TEMP_SIMPLE_AUTH) return authenticateTemporarily(req, res, next);
     return res.status(401).json({ error: 'Token invalide ou expire.' });
   }
 }
