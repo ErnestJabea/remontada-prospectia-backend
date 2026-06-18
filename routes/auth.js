@@ -442,9 +442,8 @@ router.delete('/devices/:id', authenticate, async (req, res) => {
 });
 
 router.post('/refresh', async (req, res) => {
-  const bodyRefreshToken = req.body?.refreshToken;
-  const refreshToken = bodyRefreshToken || req.cookies?.[REFRESH_COOKIE];
-  const cookieSession = !bodyRefreshToken && Boolean(req.cookies?.[REFRESH_COOKIE]);
+  const refreshToken = req.cookies?.[REFRESH_COOKIE] || req.body?.refreshToken;
+  const cookieSession = Boolean(req.cookies?.[REFRESH_COOKIE]);
   if (!refreshToken) return res.status(401).json({ error: 'Refresh token manquant.' });
 
   const connection = await pool.getConnection();
@@ -501,7 +500,7 @@ router.post('/refresh', async (req, res) => {
 });
 
 router.post('/logout', async (req, res) => {
-  const refreshToken = req.body?.refreshToken || req.cookies?.[REFRESH_COOKIE];
+  const refreshToken = req.cookies?.[REFRESH_COOKIE] || req.body?.refreshToken;
   if (refreshToken) {
     await pool.query(
       'DELETE FROM refresh_tokens WHERE token_hash = ?',
