@@ -105,6 +105,23 @@ router.get('/:id', authenticate, async (req, res) => {
   }
 });
 
+router.get('/:id/devices', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, device_id, device_name, authorized_at, last_used_at
+       FROM user_authorized_devices
+       WHERE user_id = ?
+       ORDER BY last_used_at DESC`,
+      [req.params.id]
+    );
+    return res.json(rows);
+  } catch (err) {
+    console.error('[USERS/DEVICES]', err);
+    return res.status(500).json({ error: 'Erreur serveur.' });
+  }
+});
+
+
 router.post('/', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (req, res) => {
   const {
     username, password, full_name, first_name, last_name,

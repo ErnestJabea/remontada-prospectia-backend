@@ -19,6 +19,7 @@ router.post('/push', authenticate, async (req, res) => {
   let successCount = 0;
   let conflictCount = 0;
   let errorCount = 0;
+  const localToServerIdMap = new Map();
 
   for (const actionItem of actions) {
     const { id: localId, action, type, payload } = actionItem;
@@ -66,6 +67,7 @@ router.post('/push', authenticate, async (req, res) => {
           );
 
           successCount++;
+          localToServerIdMap.set(localId, resInsert.insertId);
           results.push({ localId, status: 'success', serverId: resInsert.insertId });
           syncHistoryDetails.push(`Prospect créé via synchro: ${payload.name} (ID: ${resInsert.insertId})`);
 
@@ -144,6 +146,13 @@ router.post('/push', authenticate, async (req, res) => {
       } 
       else if (type === 'opportunity') {
         if (action === 'create') {
+          // Résoudre les identifiants locaux s'ils ont été créés lors de la même session offline
+          if (localToServerIdMap.has(payload.institution_id)) {
+            payload.institution_id = localToServerIdMap.get(payload.institution_id);
+          }
+          if (payload.mission_id && localToServerIdMap.has(payload.mission_id)) {
+            payload.mission_id = localToServerIdMap.get(payload.mission_id);
+          }
           // Check double validation
           const doubleValidationRequired = parseFloat(payload.estimated_amount) > 50000000;
           const initialStatus = doubleValidationRequired ? 'SUBMITTED' : 'DETECTED';

@@ -6,8 +6,47 @@ const fs = require('fs');
 const path = require('path');
 const pool = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
+const multer = require('multer');
 
 const router = express.Router();
+
+const ALLOWED_FILE_TYPES = new Map([
+  ['application/pdf', new Set(['.pdf'])],
+  ['image/jpeg', new Set(['.jpg', '.jpeg'])],
+  ['image/png', new Set(['.png'])],
+  ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', new Set(['.docx'])],
+  ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', new Set(['.xlsx'])]
+]);
+
+const uploadDir = path.join(__dirname, '..', 'uploads', 'missions');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: (req, file, callback) => callback(null, uploadDir),
+  filename: (req, file, callback) => {
+    const extension = path.extname(file.originalname).toLowerCase();
+    callback(null, `${crypto.randomUUID()}${extension}`);
+  }
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024, files: 5 },
+  fileFilter: (req, file, callback) => {
+    const extension = path.extname(file.originalname).toLowerCase();
+    if (!ALLOWED_FILE_TYPES.get(file.mimetype)?.has(extension)) {
+      const error = new Error('Type de fichier non autorise.');
+      error.status = 400;
+      return callback(error);
+    }
+    return callback(null, true);
+  }
+});
+
+function cleanupUploadedFiles(files = []) {
+  for (const file of files) {
+    if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+  }
+}
 const MANAGER_ROLES = new Set(['DIRECTION', 'SYSTEM', 'ADMIN']);
 const ALLOWED_STATUSES = [
   'DRAFT', 'SUBMITTED', 'IN_VALIDATION', 'VALIDATED', 'PLANNED',
@@ -276,7 +315,8 @@ router.get('/', authenticate, async (req, res) => {
     let query = `
       SELECT m.*, o.title AS objective_title, i.name AS institution_name,
              u.full_name AS primary_commercial_name, r.name AS region_name,
-             d.name AS department_name, c.name AS city_name
+             r.name_en AS region_name_en, d.name AS department_name,
+             d.name_en AS department_name_en, c.name AS city_name, c.name_en AS city_name_en
       FROM crm_missions m
       JOIN crm_objectives o ON m.objective_id = o.id
       JOIN crm_institutions i ON m.institution_id = i.id
@@ -326,7 +366,8 @@ router.get('/:id', authenticate, async (req, res) => {
     const [rows] = await pool.query(
       `SELECT m.*, o.title AS objective_title, i.name AS institution_name,
               u.full_name AS primary_commercial_name, r.name AS region_name,
-              d.name AS department_name, c.name AS city_name
+              r.name_en AS region_name_en, d.name AS department_name,
+              d.name_en AS department_name_en, c.name AS city_name, c.name_en AS city_name_en
        FROM crm_missions m
        JOIN crm_objectives o ON m.objective_id = o.id
        JOIN crm_institutions i ON m.institution_id = i.id
@@ -348,7 +389,20 @@ router.get('/:id', authenticate, async (req, res) => {
       'SELECT id, status FROM crm_reports WHERE mission_id = ?',
       [req.params.id]
     );
-    return res.json({ ...rows[0], associates, report: reports[0] || null });
+    // Récupérer les pièces jointes
+    const [attachments] = await pool.query(
+      `SELECT id, file_name, file_size, created_at
+       FROM crm_mission_attachments
+       WHERE mission_id = ?
+       ORDER BY created_at DESC`,
+      [req.params.id]
+    );
+    return res.json({ 
+      ...rows[0], 
+      associates, 
+      report: reports[0] || null,
+      attachments
+    });
   } catch (err) {
     console.error('[MISSIONS/DETAIL]', err);
     return res.status(500).json({ error: 'Erreur serveur.' });
@@ -883,6 +937,94 @@ router.delete('/:id', authenticate, authorize('DIRECTION', 'SYSTEM', 'ADMIN'), a
   } catch (err) {
     console.error('[MISSIONS/DELETE]', err);
     return res.status(409).json({ error: 'Cette mission ne peut pas etre supprimee.' });
+  }
+});
+
+/**
+ * POST /:id/attachments - Ajouter des pièces jointes à la mission
+ */
+router.post('/:id/attachments', authenticate, upload.array('files', 5), async (req, res) => {
+  try {
+    const access = await getMissionAccess(req.params.id, req.user);
+    if (!access.mission) {
+      cleanupUploadedFiles(req.files);
+      return res.status(404).json({ error: 'Mission introuvable.' });
+    }
+    if (!access.canRead) {
+      cleanupUploadedFiles(req.files);
+      return res.status(403).json({ error: 'Accès refusé.' });
+    }
+    if (!req.files?.length) return res.status(400).json({ error: 'Aucun fichier fourni.' });
+
+    const inserts = req.files.map(file => [
+      req.params.id,
+      path.basename(file.originalname),
+      file.path,
+      file.size
+    ]);
+    await pool.query(
+      `INSERT INTO crm_mission_attachments (mission_id, file_name, file_path, file_size)
+       VALUES ?`,
+      [inserts]
+    );
+    return res.status(201).json({ message: `${req.files.length} fichier(s) ajouté(s).` });
+  } catch (err) {
+    cleanupUploadedFiles(req.files);
+    console.error('[MISSIONS/ATTACH]', err);
+    return res.status(500).json({ error: 'Erreur serveur.' });
+  }
+});
+
+/**
+ * GET /:id/attachments/:attId/download - Télécharger une pièce jointe de mission
+ */
+router.get('/:id/attachments/:attId/download', authenticate, async (req, res) => {
+  try {
+    const access = await getMissionAccess(req.params.id, req.user);
+    if (!access.mission) return res.status(404).json({ error: 'Mission introuvable.' });
+    if (!access.canRead) return res.status(403).json({ error: 'Accès refusé.' });
+
+    const [rows] = await pool.query(
+      `SELECT file_name, file_path
+       FROM crm_mission_attachments
+       WHERE id = ? AND mission_id = ?`,
+      [req.params.attId, req.params.id]
+    );
+    if (!rows.length || !fs.existsSync(rows[0].file_path)) {
+      return res.status(404).json({ error: 'Pièce jointe introuvable.' });
+    }
+    return res.download(path.resolve(rows[0].file_path), rows[0].file_name);
+  } catch (err) {
+    console.error('[MISSIONS/DOWNLOAD]', err);
+    return res.status(500).json({ error: 'Erreur serveur.' });
+  }
+});
+
+/**
+ * DELETE /:id/attachments/:attId - Supprimer une pièce jointe de mission
+ */
+router.delete('/:id/attachments/:attId', authenticate, async (req, res) => {
+  try {
+    const access = await getMissionAccess(req.params.id, req.user);
+    if (!access.mission) return res.status(404).json({ error: 'Mission introuvable.' });
+    if (!access.canWrite) return res.status(403).json({ error: 'Accès refusé.' });
+
+    const [rows] = await pool.query(
+      `SELECT file_path
+       FROM crm_mission_attachments
+       WHERE id = ? AND mission_id = ?`,
+      [req.params.attId, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Pièce jointe introuvable.' });
+    if (fs.existsSync(rows[0].file_path)) fs.unlinkSync(rows[0].file_path);
+    await pool.query(
+      'DELETE FROM crm_mission_attachments WHERE id = ? AND mission_id = ?',
+      [req.params.attId, req.params.id]
+    );
+    return res.json({ message: 'Pièce jointe supprimée.' });
+  } catch (err) {
+    console.error('[MISSIONS/ATTACH_DELETE]', err);
+    return res.status(500).json({ error: 'Erreur serveur.' });
   }
 });
 

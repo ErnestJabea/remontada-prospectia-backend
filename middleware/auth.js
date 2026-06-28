@@ -69,6 +69,17 @@ async function authenticate(req, res, next) {
       role: rows[0].role
     };
 
+    // Mettre à jour l'activité en arrière-plan (non bloquant)
+    pool.query(
+      `UPDATE users 
+       SET last_activity = NOW(), 
+           last_active_client = ? 
+       WHERE id = ?`,
+      [decoded.clientType || 'unknown', rows[0].id]
+    ).catch(err => {
+      console.error('[MIDDLEWARE_LAST_ACTIVITY_ERROR]', err.message);
+    });
+
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       res.once('finish', () => {
         if (res.statusCode >= 500) return;

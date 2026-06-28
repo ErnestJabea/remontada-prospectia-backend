@@ -96,6 +96,7 @@ const opportunitiesRoutes = require('./routes/opportunities');
 const reportsRoutes = require('./routes/reports');
 const syncRoutes = require('./routes/sync');
 const notificationsRoutes = require('./routes/notifications');
+const securityRoutes = require('./routes/security');
 
 app.use('/api/auth/login', loginLimiter);
 app.use('/api/auth/verify-mfa', loginLimiter);
@@ -111,6 +112,7 @@ app.use('/api/opportunities', opportunitiesRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/sync', syncRoutes);
 app.use('/api/notifications', notificationsRoutes);
+app.use('/api/security', securityRoutes);
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -138,3 +140,5 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+// reload crm cnf, routes, and mailer
+

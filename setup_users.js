@@ -30,6 +30,7 @@ async function setupUsers() {
   }
 
   for (const user of users) {
+    console.log(`Hashing password for ${user.username}: [${process.env[user.env]}] (length: ${process.env[user.env]?.length})`);
     const hash = await bcrypt.hash(process.env[user.env], 12);
     await pool.query(
       'UPDATE users SET password = ? WHERE username = ?',

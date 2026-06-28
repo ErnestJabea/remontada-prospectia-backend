@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS users (
     failed_login_attempts INT DEFAULT 0,
     blocked_until TIMESTAMP NULL DEFAULT NULL,
     last_login TIMESTAMP NULL DEFAULT NULL,
+    last_activity TIMESTAMP NULL DEFAULT NULL,
+    last_active_client ENUM('web_portal', 'mobile_pwa', 'unknown') DEFAULT 'unknown',
     avatar_url VARCHAR(255) DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -99,10 +101,20 @@ CREATE TABLE IF NOT EXISTS user_authorized_devices (
 -- 2. RÉFÉRENTIELS GÉOGRAPHIQUES
 -- =====================================================
 
-CREATE TABLE IF NOT EXISTS crm_ref_regions (
+CREATE TABLE IF NOT EXISTS crm_ref_countries (
     id INT AUTO_INCREMENT PRIMARY KEY,
     code VARCHAR(10) UNIQUE NOT NULL,
-    name VARCHAR(100) NOT NULL
+    name VARCHAR(100) NOT NULL,
+    name_en VARCHAR(255) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS crm_ref_regions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    country_id INT DEFAULT NULL,
+    code VARCHAR(10) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    name_en VARCHAR(255) DEFAULT NULL,
+    FOREIGN KEY (country_id) REFERENCES crm_ref_countries(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS crm_ref_departments (
@@ -110,6 +122,7 @@ CREATE TABLE IF NOT EXISTS crm_ref_departments (
     region_id INT NOT NULL,
     code VARCHAR(10) UNIQUE NOT NULL,
     name VARCHAR(100) NOT NULL,
+    name_en VARCHAR(255) DEFAULT NULL,
     FOREIGN KEY (region_id) REFERENCES crm_ref_regions(id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -117,6 +130,7 @@ CREATE TABLE IF NOT EXISTS crm_ref_cities (
     id INT AUTO_INCREMENT PRIMARY KEY,
     department_id INT NOT NULL,
     name VARCHAR(100) NOT NULL,
+    name_en VARCHAR(255) DEFAULT NULL,
     FOREIGN KEY (department_id) REFERENCES crm_ref_departments(id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -129,7 +143,7 @@ CREATE TABLE IF NOT EXISTS crm_objectives (
     title VARCHAR(150) NOT NULL,
     description TEXT,
     parent_id INT DEFAULT NULL,
-    period_type ENUM('ANNUAL', 'SEMESTRIAL', 'TRIMESTRIAL', 'MONTHLY', 'EXCEPTIONAL') NOT NULL,
+    period_type VARCHAR(50) NOT NULL,
     start_date DATE NOT NULL,
     end_date DATE NOT NULL,
     assignee_id INT DEFAULT NULL,
@@ -153,7 +167,7 @@ CREATE TABLE IF NOT EXISTS crm_objectives (
 CREATE TABLE IF NOT EXISTS crm_institutions (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(200) UNIQUE NOT NULL,
-    type ENUM('ADMINISTRATION', 'ENTERPRISE_PUBLIQUE', 'CTD', 'PROSPECT') NOT NULL,
+    type VARCHAR(50) NOT NULL DEFAULT 'PROSPECT',
     tax_id VARCHAR(50) UNIQUE DEFAULT NULL,
     address TEXT,
     region_id INT NOT NULL,
@@ -180,7 +194,7 @@ CREATE TABLE IF NOT EXISTS crm_contacts (
     email VARCHAR(100),
     phone VARCHAR(50),
     job_title VARCHAR(150) NOT NULL,
-    influence_level ENUM('DECIDEUR', 'PRESCRIPTEUR', 'INFLUENCEUR', 'FACILITATEUR') NOT NULL,
+    influence_level VARCHAR(50) NOT NULL,
     notes TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -234,9 +248,9 @@ CREATE TABLE IF NOT EXISTS crm_opportunities (
     title VARCHAR(150) NOT NULL,
     need_description TEXT NOT NULL,
     estimated_amount DECIMAL(15,2) NOT NULL,
-    priority ENUM('LOW', 'MEDIUM', 'HIGH') DEFAULT 'MEDIUM',
-    status ENUM('DETECTED', 'QUALIFIED', 'SUBMITTED', 'IN_VALIDATION', 'VALIDATED', 'REJECTED', 'IN_NEGOTIATION', 'WON', 'LOST', 'ARCHIVED') DEFAULT 'DETECTED',
-    pipeline_stage ENUM('DETECTION', 'QUALIFICATION', 'ANALYSE', 'PROPOSITION', 'NEGOCIATION', 'DECISION', 'SIGNATURE') DEFAULT 'DETECTION',
+    priority VARCHAR(50) DEFAULT 'MEDIUM',
+    status VARCHAR(50) NOT NULL DEFAULT 'DETECTED',
+    pipeline_stage VARCHAR(50) NOT NULL DEFAULT 'DETECTION',
     assigned_to INT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -287,6 +301,19 @@ CREATE TABLE IF NOT EXISTS crm_audit_logs (
     ip_address VARCHAR(45) NOT NULL,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS crm_login_history (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NULL,
+    username VARCHAR(50) NOT NULL,
+    ip_address VARCHAR(45) NOT NULL,
+    user_agent VARCHAR(255) DEFAULT NULL,
+    client_type ENUM('web_portal', 'mobile_pwa', 'unknown') NOT NULL DEFAULT 'unknown',
+    status ENUM('SUCCESS', 'FAILED', 'BLOCKED') NOT NULL,
+    failure_reason VARCHAR(100) DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS crm_sync_history (
@@ -347,42 +374,113 @@ VALUES
 (1, 'crm', 'institutions',  1, 1, 1, 1, 1, 1);
 
 -- Référentiels géographiques (Cameroun)
-INSERT IGNORE INTO crm_ref_regions (id, code, name) VALUES
-(1, 'CE', 'Centre'),
-(2, 'LT', 'Littoral'),
-(3, 'OU', 'Ouest'),
-(4, 'SU', 'Sud'),
-(5, 'NO', 'Nord'),
-(6, 'EN', 'Extrême-Nord'),
-(7, 'AD', 'Adamaoua'),
-(8, 'ES', 'Est'),
-(9, 'NW', 'Nord-Ouest'),
-(10, 'SW', 'Sud-Ouest');
+INSERT IGNORE INTO crm_ref_countries (id, code, name, name_en) VALUES
+(1, 'CMR', 'Cameroun', 'Cameroon');
 
-INSERT IGNORE INTO crm_ref_departments (id, region_id, code, name) VALUES
-(1, 1, 'MEFOU', 'Mefou-et-Afamba'),
-(2, 1, 'MFOUNDI', 'Mfoundi'),
-(3, 2, 'WOURI', 'Wouri'),
-(4, 3, 'MIFI', 'Mifi'),
-(5, 4, 'MVILA', 'Mvila'),
-(6, 5, 'BENOUE', 'Bénoué'),
-(7, 6, 'DIAMARE', 'Diamaré'),
-(8, 7, 'VINA', 'Vina'),
-(9, 8, 'LOM_ET_DJEREM', 'Lom-et-Djérem'),
-(10, 9, 'MEZAM', 'Mezam'),
-(11, 10, 'FAKO', 'Fako');
+INSERT IGNORE INTO crm_ref_regions (id, country_id, code, name, name_en) VALUES
+(1, 1, 'CE', 'Centre', 'Center'),
+(2, 1, 'LT', 'Littoral', 'Littoral'),
+(3, 1, 'OU', 'Ouest', 'West'),
+(4, 1, 'SU', 'Sud', 'South'),
+(5, 1, 'NO', 'Nord', 'North'),
+(6, 1, 'EN', 'Extrême-Nord', 'Far North'),
+(7, 1, 'AD', 'Adamaoua', 'Adamawa'),
+(8, 1, 'ES', 'Est', 'East'),
+(9, 1, 'NW', 'Nord-Ouest', 'North West'),
+(10, 1, 'SW', 'Sud-Ouest', 'South West');
 
-INSERT IGNORE INTO crm_ref_cities (id, department_id, name) VALUES
-(1, 2, 'Yaoundé'),
-(2, 3, 'Douala'),
-(3, 4, 'Bafoussam'),
-(4, 5, 'Ebolowa'),
-(5, 6, 'Garoua'),
-(6, 7, 'Maroua'),
-(7, 8, 'Ngaoundéré'),
-(8, 9, 'Bertoua'),
-(9, 10, 'Bamenda'),
-(10, 11, 'Limbé');
+-- Référentiels statiques CRM
+CREATE TABLE IF NOT EXISTS crm_ref_institution_types (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    code VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    name_en VARCHAR(255) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO crm_ref_institution_types (id, code, name, name_en) VALUES
+(1, 'PROSPECT', 'Prospect', 'Prospect'),
+(2, 'ADMINISTRATION', 'Administration', 'Administration'),
+(3, 'ENTERPRISE_PUBLIQUE', 'Entreprise Publique', 'Public Enterprise'),
+(4, 'CTD', 'Collectivité Territoriale (CTD)', 'Decentralized Territorial Community');
+
+CREATE TABLE IF NOT EXISTS crm_ref_influence_levels (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    code VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    name_en VARCHAR(255) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO crm_ref_influence_levels (id, code, name, name_en) VALUES
+(1, 'DECIDEUR', 'Décideur', 'Decision Maker'),
+(2, 'PRESCRIPTEUR', 'Prescripteur', 'Advisor'),
+(3, 'INFLUENCEUR', 'Influenceur', 'Influencer'),
+(4, 'FACILITATEUR', 'Facilitateur', 'Facilitator');
+
+CREATE TABLE IF NOT EXISTS crm_ref_priorities (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    code VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    name_en VARCHAR(255) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO crm_ref_priorities (id, code, name, name_en) VALUES
+(1, 'LOW', 'Faible', 'Low'),
+(2, 'MEDIUM', 'Moyenne', 'Medium'),
+(3, 'HIGH', 'Élevée', 'High');
+
+CREATE TABLE IF NOT EXISTS crm_ref_mission_types (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    code VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    name_en VARCHAR(255) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO crm_ref_mission_types (id, code, name, name_en) VALUES
+(1, 'PROSPECTION', 'Prospection', 'Prospection'),
+(2, 'RELANCE', 'Relance', 'Follow-up'),
+(3, 'NEGOCIATION', 'Négociation', 'Negotiation'),
+(4, 'SIGNATURE', 'Signature', 'Signature'),
+(5, 'SUIVI', 'Suivi', 'Monitoring'),
+(6, 'AUTRE', 'Autre', 'Other');
+
+CREATE TABLE IF NOT EXISTS crm_ref_period_types (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    code VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    name_en VARCHAR(255) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO crm_ref_period_types (id, code, name, name_en) VALUES
+(1, 'ANNUAL', 'Annuel', 'Annual'),
+(2, 'SEMESTRIAL', 'Semestriel', 'Semestrial'),
+(3, 'TRIMESTRIAL', 'Trimestriel', 'Trimestrial'),
+(4, 'MONTHLY', 'Mensuel', 'Monthly'),
+(5, 'EXCEPTIONAL', 'Exceptionnel', 'Exceptional');
+
+INSERT IGNORE INTO crm_ref_departments (id, region_id, code, name, name_en) VALUES
+(1, 1, 'MEFOU', 'Mefou-et-Afamba', 'Mefou-et-Afamba'),
+(2, 1, 'MFOUNDI', 'Mfoundi', 'Mfoundi'),
+(3, 2, 'WOURI', 'Wouri', 'Wouri'),
+(4, 3, 'MIFI', 'Mifi', 'Mifi'),
+(5, 4, 'MVILA', 'Mvila', 'Mvila'),
+(6, 5, 'BENOUE', 'Bénoué', 'Benoue'),
+(7, 6, 'DIAMARE', 'Diamaré', 'Diamare'),
+(8, 7, 'VINA', 'Vina', 'Vina'),
+(9, 8, 'LOM_ET_DJEREM', 'Lom-et-Djérem', 'Lom-et-Djerem'),
+(10, 9, 'MEZAM', 'Mezam', 'Mezam'),
+(11, 10, 'FAKO', 'Fako', 'Fako');
+
+INSERT IGNORE INTO crm_ref_cities (id, department_id, name, name_en) VALUES
+(1, 2, 'Yaoundé', 'Yaounde'),
+(2, 3, 'Douala', 'Douala'),
+(3, 4, 'Bafoussam', 'Bafoussam'),
+(4, 5, 'Ebolowa', 'Ebolowa'),
+(5, 6, 'Garoua', 'Garoua'),
+(6, 7, 'Maroua', 'Maroua'),
+(7, 8, 'Ngaoundéré', 'Ngaoundere'),
+(8, 9, 'Bertoua', 'Bertoua'),
+(9, 10, 'Bamenda', 'Bamenda'),
+(10, 11, 'Limbé', 'Limbe');
 
 -- Utilisateurs par défaut (mot de passe : à hasher via script create_users.js)
 -- Les mots de passe seront hashés à l'initialisation

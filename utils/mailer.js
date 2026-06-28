@@ -38,6 +38,7 @@ function logDevelopmentOtp(username, otp) {
 }
 
 async function sendOTPEmail(to, username, otp) {
+  logDevelopmentOtp(username, otp);
   const emailBody = `
     <div style="font-family: Arial, sans-serif; max-width: 520px; margin: auto; padding: 28px;">
       <h2 style="color: #e31e24;">Remontada Prospectia</h2>

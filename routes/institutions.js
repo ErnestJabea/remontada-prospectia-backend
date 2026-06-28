@@ -52,7 +52,7 @@ router.get('/', authenticate, async (req, res) => {
     await ensureInstitutionStatusColumn();
     const { type, regionId } = req.query;
     let query = `
-      SELECT i.*, r.name AS region_name, d.name AS department_name, c.name AS city_name
+      SELECT i.*, r.name AS region_name, r.name_en AS region_name_en, d.name AS department_name, d.name_en AS department_name_en, c.name AS city_name, c.name_en AS city_name_en
       FROM crm_institutions i
       JOIN crm_ref_regions r ON i.region_id = r.id
       JOIN crm_ref_departments d ON i.department_id = d.id
@@ -81,7 +81,7 @@ router.get('/:id', authenticate, async (req, res) => {
   try {
     await ensureInstitutionStatusColumn();
     const [rows] = await pool.query(
-      `SELECT i.*, r.name AS region_name, d.name AS department_name, c.name AS city_name
+      `SELECT i.*, r.name AS region_name, r.name_en AS region_name_en, d.name AS department_name, d.name_en AS department_name_en, c.name AS city_name, c.name_en AS city_name_en
        FROM crm_institutions i
        JOIN crm_ref_regions r ON i.region_id = r.id
        JOIN crm_ref_departments d ON i.department_id = d.id
