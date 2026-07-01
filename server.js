@@ -6,7 +6,7 @@ const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const app = express();
-app.set('trust proxy', true);
+app.set('trust proxy', 1); // Un seul proxy de confiance devant Node.js (Nginx)
 const PORT = process.env.PORT || 3002;
 
 for (const requiredSecret of ['JWT_SECRET', 'JWT_REFRESH_SECRET']) {
