@@ -5,10 +5,12 @@ const fs = require('fs');
 const crypto = require('crypto');
 const pool = require('../db');
 const { authenticate } = require('../middleware/auth');
+const ReportWorkflowService = require('../services/reportWorkflow');
+const ReportPdfService = require('../services/reportPdfService');
 
 const router = express.Router();
 const MANAGER_ROLES = new Set(['DIRECTION', 'SYSTEM', 'ADMIN']);
-const REPORT_STATUSES = ['DRAFT', 'SUBMITTED', 'VALIDATED', 'REJECTED'];
+
 const ALLOWED_FILE_TYPES = new Map([
   ['application/pdf', new Set(['.pdf'])],
   ['image/jpeg', new Set(['.jpg', '.jpeg'])],
@@ -52,52 +54,63 @@ function cleanupUploadedFiles(files = []) {
 }
 
 async function getReportAccess(reportId, user) {
-  const [rows] = await pool.query(
-    `SELECT rp.*, m.primary_commercial_id
-     FROM crm_reports rp
-     JOIN crm_missions m ON rp.mission_id = m.id
-     WHERE rp.id = ?`,
-    [reportId]
-  );
-  if (!rows.length) return { report: null, allowed: false };
+  const report = await ReportWorkflowService.getReport(reportId);
+  if (!report) return { report: null, allowed: false };
   return {
-    report: rows[0],
-    allowed: isManager(user) || rows[0].primary_commercial_id === user.id
+    report,
+    allowed: ReportWorkflowService.canAccess(report, user)
   };
 }
 
-async function canAccessMission(missionId, user) {
-  if (isManager(user)) return true;
-  const [rows] = await pool.query(
-    `SELECT 1
-     FROM crm_missions
-     WHERE id = ? AND primary_commercial_id = ?`,
-    [missionId, user.id]
-  );
-  return rows.length > 0;
-}
-
+/**
+ * GET /api/reports - List activity reports
+ */
 router.get('/', authenticate, async (req, res) => {
   try {
-    const { status } = req.query;
+    const { status, report_type, commercial_id, institution_id } = req.query;
+
     let query = `
-      SELECT rp.*, m.title AS mission_title, m.scheduled_date,
+      SELECT rp.*, 
+             m.title AS mission_title, m.scheduled_date,
+             o.title AS objective_title,
+             i.name AS institution_name,
              u.full_name AS commercial_name
       FROM crm_reports rp
-      JOIN crm_missions m ON rp.mission_id = m.id
-      JOIN users u ON m.primary_commercial_id = u.id`;
+      LEFT JOIN crm_missions m ON rp.mission_id = m.id
+      LEFT JOIN crm_objectives o ON rp.objective_id = o.id
+      LEFT JOIN crm_institutions i ON rp.institution_id = i.id
+      LEFT JOIN users u ON rp.commercial_id = u.id
+    `;
     const params = [];
     const conditions = [];
+
+    // Role-based restrictions
     if (req.user.role === 'COMMERCIAL') {
-      conditions.push('m.primary_commercial_id = ?');
-      params.push(req.user.id);
+      conditions.push('(rp.commercial_id = ? OR m.primary_commercial_id = ?)');
+      params.push(req.user.id, req.user.id);
+    } else if (commercial_id) {
+      conditions.push('(rp.commercial_id = ? OR m.primary_commercial_id = ?)');
+      params.push(Number(commercial_id), Number(commercial_id));
     }
-    if (status && REPORT_STATUSES.includes(status)) {
+
+    if (status) {
       conditions.push('rp.status = ?');
       params.push(status);
     }
-    if (conditions.length) query += ` WHERE ${conditions.join(' AND ')}`;
+    if (report_type) {
+      conditions.push('rp.report_type = ?');
+      params.push(report_type);
+    }
+    if (institution_id) {
+      conditions.push('rp.institution_id = ?');
+      params.push(Number(institution_id));
+    }
+
+    if (conditions.length) {
+      query += ` WHERE ${conditions.join(' AND ')}`;
+    }
     query += ' ORDER BY rp.created_at DESC';
+
     const [rows] = await pool.query(query, params);
     return res.json(rows);
   } catch (err) {
@@ -106,6 +119,9 @@ router.get('/', authenticate, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/reports/:id - Get report details
+ */
 router.get('/:id', authenticate, async (req, res) => {
   try {
     const access = await getReportAccess(req.params.id, req.user);
@@ -113,78 +129,378 @@ router.get('/:id', authenticate, async (req, res) => {
     if (!access.allowed) return res.status(403).json({ error: 'Acces refuse.' });
 
     const [rows] = await pool.query(
-      `SELECT rp.*, m.title AS mission_title, m.scheduled_date,
-              i.name AS institution_name, u.full_name AS commercial_name
+      `SELECT rp.*, 
+              m.title AS mission_title, m.scheduled_date,
+              o.title AS objective_title, 
+              i.name AS institution_name, i.address AS institution_address,
+              u.full_name AS commercial_name,
+              submitted.full_name AS submitted_by_name,
+              validated.full_name AS validated_by_name,
+              rejected.full_name AS rejected_by_name,
+              correction.full_name AS correction_requested_by_name,
+              archived.full_name AS archived_by_name
        FROM crm_reports rp
-       JOIN crm_missions m ON rp.mission_id = m.id
-       JOIN crm_institutions i ON m.institution_id = i.id
-       JOIN users u ON m.primary_commercial_id = u.id
+       LEFT JOIN crm_missions m ON rp.mission_id = m.id
+       LEFT JOIN crm_objectives o ON rp.objective_id = o.id
+       LEFT JOIN crm_institutions i ON rp.institution_id = i.id
+       LEFT JOIN users u ON rp.commercial_id = u.id
+       LEFT JOIN users submitted ON rp.submitted_by = submitted.id
+       LEFT JOIN users validated ON rp.validated_by = validated.id
+       LEFT JOIN users rejected ON rp.rejected_by = rejected.id
+       LEFT JOIN users correction ON rp.correction_requested_by = correction.id
+       LEFT JOIN users archived ON rp.archived_by = archived.id
        WHERE rp.id = ?`,
       [req.params.id]
     );
+
+    // Fetch attachments
     const [attachments] = await pool.query(
-      `SELECT id, report_id, file_name, file_size, created_at
+      `SELECT id, file_name, file_size, created_at
        FROM crm_report_attachments
        WHERE report_id = ?`,
       [req.params.id]
     );
-    return res.json({ ...rows[0], attachments });
+
+    // Fetch linked opportunities
+    const [opportunities] = await pool.query(
+      `SELECT o.*, ro.relation_type
+       FROM crm_report_opportunities ro
+       JOIN crm_opportunities o ON ro.opportunity_id = o.id
+       WHERE ro.activity_report_id = ?`,
+      [req.params.id]
+    );
+
+    // Fetch workflow history
+    const [history] = await pool.query(
+      `SELECT h.*, u.full_name AS performed_by_name
+       FROM crm_report_histories h
+       JOIN users u ON h.performed_by = u.id
+       WHERE h.activity_report_id = ?
+       ORDER BY h.performed_at ASC`,
+      [req.params.id]
+    );
+
+    // Fetch comments
+    const [comments] = await pool.query(
+      `SELECT c.*, u.full_name AS user_name, u.avatar_url
+       FROM crm_report_comments c
+       JOIN users u ON c.user_id = u.id
+       WHERE c.activity_report_id = ?
+       ORDER BY c.created_at ASC`,
+      [req.params.id]
+    );
+
+    return res.json({
+      ...rows[0],
+      attachments,
+      opportunities,
+      history,
+      comments
+    });
   } catch (err) {
     console.error('[REPORTS/DETAIL]', err);
     return res.status(500).json({ error: 'Erreur serveur.' });
   }
 });
 
+/**
+ * POST /api/reports - Create manual draft report
+ */
 router.post('/', authenticate, async (req, res) => {
   const {
-    mission_id, executive_summary, administrations_visited,
-    persons_met, difficulties, recommendations
+    report_type, mission_id, objective_id, institution_id,
+    period_start, period_end, executive_summary, results,
+    diagnosis, difficulties, recommendations, next_steps
   } = req.body;
-  if (
-    !Number(mission_id) || typeof executive_summary !== 'string' ||
-    !executive_summary.trim() || typeof administrations_visited !== 'string' ||
-    !administrations_visited.trim() || typeof persons_met !== 'string' ||
-    !persons_met.trim()
-  ) {
-    return res.status(400).json({ error: 'Donnees de rapport invalides.' });
-  }
 
   try {
-    if (!(await canAccessMission(mission_id, req.user))) {
-      return res.status(403).json({ error: 'Acces refuse a cette mission.' });
-    }
+    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const defaultType = report_type || 'activity_report';
+
     const [result] = await pool.query(
       `INSERT INTO crm_reports (
-        mission_id, executive_summary, administrations_visited,
-        persons_met, difficulties, recommendations, status
-      ) VALUES (?, ?, ?, ?, ?, ?, 'DRAFT')`,
+        report_type, mission_id, objective_id, institution_id,
+        commercial_id, period_start, period_end, status,
+        executive_summary, results, diagnosis, difficulties,
+        recommendations, next_steps, generated_from, generated_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'A_COMPLETER', ?, ?, ?, ?, ?, ?, 'manual', ?)`,
       [
-        mission_id, executive_summary.trim(), administrations_visited.trim(),
-        persons_met.trim(), difficulties || null, recommendations || null
+        defaultType,
+        mission_id ? Number(mission_id) : null,
+        objective_id ? Number(objective_id) : null,
+        institution_id ? Number(institution_id) : null,
+        req.user.id,
+        period_start || null,
+        period_end || null,
+        (executive_summary || '').trim(),
+        (results || '').trim(),
+        (diagnosis || '').trim(),
+        (difficulties || '').trim(),
+        (recommendations || '').trim(),
+        (next_steps || '').trim(),
+        req.user.id
       ]
     );
-    return res.status(201).json({ id: result.insertId, message: 'Rapport cree.' });
+
+    const reportId = result.insertId;
+    const code = `RAP-${dateStr}-${String(reportId).padStart(4, '0')}`;
+    
+    await pool.query('UPDATE crm_reports SET code = ? WHERE id = ?', [code, reportId]);
+
+    // Log history
+    await ReportWorkflowService.logHistory(reportId, null, 'A_COMPLETER', 'Création manuelle', 'Brouillon créé manuellement', req.user.id);
+
+    return res.status(201).json({ id: reportId, code, message: 'Rapport créé.' });
   } catch (err) {
-    if (err.code === 'ER_DUP_ENTRY') {
-      return res.status(409).json({ error: 'Un rapport existe deja pour cette mission.' });
-    }
     console.error('[REPORTS/CREATE]', err);
     return res.status(500).json({ error: 'Erreur serveur.' });
   }
 });
 
+/**
+ * PUT /api/reports/:id - Update report details
+ */
 router.put('/:id', authenticate, async (req, res) => {
   const {
-    executive_summary, administrations_visited, persons_met,
-    difficulties, recommendations, status
+    executive_summary, results, diagnosis, difficulties,
+    recommendations, next_steps, institution_id, objective_id,
+    period_start, period_end, persons_met, opportunities
   } = req.body;
-  if (
-    typeof executive_summary !== 'string' || !executive_summary.trim() ||
-    typeof administrations_visited !== 'string' || !administrations_visited.trim() ||
-    typeof persons_met !== 'string' || !persons_met.trim() ||
-    !REPORT_STATUSES.includes(status)
-  ) {
-    return res.status(400).json({ error: 'Donnees de rapport invalides.' });
+
+  const conn = await pool.getConnection();
+  try {
+    const access = await getReportAccess(req.params.id, req.user);
+    if (!access.report) {
+      conn.release();
+      return res.status(404).json({ error: 'Rapport introuvable.' });
+    }
+    if (!access.allowed) {
+      conn.release();
+      return res.status(403).json({ error: 'Acces refuse.' });
+    }
+
+    // Enforce workflow restrictions: non-managers can only edit if report is in draft/to-correct status
+    const editableStatuses = ['BROUILLON_AUTO', 'A_COMPLETER', 'CORRECTION_DEMANDEE', 'DRAFT', 'REJECTED'];
+    if (!isManager(req.user) && !editableStatuses.includes(access.report.status)) {
+      conn.release();
+      return res.status(409).json({ error: 'Modification impossible sur un rapport soumis ou validé.' });
+    }
+
+    await conn.beginTransaction();
+
+    // 1. Update crm_reports table
+    await conn.query(
+      `UPDATE crm_reports
+       SET executive_summary = ?, 
+           results = ?, 
+           diagnosis = ?, 
+           difficulties = ?, 
+           recommendations = ?, 
+           next_steps = ?,
+           institution_id = ?, 
+           objective_id = ?,
+           period_start = ?,
+           period_end = ?,
+           persons_met = ?,
+           status = CASE WHEN status = 'BROUILLON_AUTO' THEN 'A_COMPLETER' ELSE status END
+       WHERE id = ?`,
+      [
+        (executive_summary || '').trim(),
+        (results || '').trim(),
+        (diagnosis || '').trim(),
+        (difficulties || '').trim(),
+        (recommendations || '').trim(),
+        (next_steps || '').trim(),
+        institution_id ? Number(institution_id) : access.report.institution_id,
+        objective_id ? Number(objective_id) : access.report.objective_id,
+        period_start || access.report.period_start,
+        period_end || access.report.period_end,
+        typeof persons_met === 'object' ? JSON.stringify(persons_met) : (persons_met || ''),
+        req.params.id
+      ]
+    );
+
+    // 2. Manage Opportunities links/creation
+    if (Array.isArray(opportunities)) {
+      // Get existing links to know what to delete
+      const [existingLinks] = await conn.query(
+        'SELECT opportunity_id FROM crm_report_opportunities WHERE activity_report_id = ?',
+        [req.params.id]
+      );
+      const existingOppIds = new Set(existingLinks.map(l => l.opportunity_id));
+      const keepOppIds = new Set();
+
+      for (const opp of opportunities) {
+        let oppId = opp.id;
+
+        // If it's a new opportunity creation payload (has a title and is not a number)
+        if (opp.title && isNaN(Number(opp.id))) {
+          // Double validation check
+          const doubleValidationRequired = parseFloat(opp.estimated_amount) > 50000000;
+          const initialStatus = doubleValidationRequired ? 'SUBMITTED' : 'DETECTED';
+
+          const [oppInsert] = await conn.query(
+            `INSERT INTO crm_opportunities (
+              institution_id, title, need_description, estimated_amount, priority, status, pipeline_stage, assigned_to
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              institution_id ? Number(institution_id) : access.report.institution_id,
+              opp.title,
+              opp.need_description || null,
+              opp.estimated_amount || 0,
+              opp.priority || 'MEDIUM',
+              initialStatus,
+              opp.pipeline_stage || 'DETECTION',
+              req.user.id
+            ]
+          );
+          oppId = oppInsert.insertId;
+        }
+
+        if (oppId) {
+          keepOppIds.add(Number(oppId));
+          // Insert or update link
+          await conn.query(
+            `INSERT INTO crm_report_opportunities (activity_report_id, opportunity_id, relation_type)
+             VALUES (?, ?, ?)
+             ON DUPLICATE KEY UPDATE relation_type = VALUES(relation_type)`,
+            [req.params.id, Number(oppId), opp.relation_type || 'PRIMARY']
+          );
+        }
+      }
+
+      // Delete old links that were removed
+      for (const oldId of existingOppIds) {
+        if (!keepOppIds.has(oldId)) {
+          await conn.query(
+            'DELETE FROM crm_report_opportunities WHERE activity_report_id = ? AND opportunity_id = ?',
+            [req.params.id, oldId]
+          );
+        }
+      }
+    }
+
+    await conn.commit();
+    return res.json({ message: 'Rapport mis a jour avec ses liaisons opportunites.' });
+  } catch (err) {
+    await conn.rollback();
+    console.error('[REPORTS/UPDATE_SYNC]', err);
+    return res.status(500).json({ error: 'Erreur serveur.' });
+  } finally {
+    conn.release();
+  }
+});
+
+/**
+ * POST /api/reports/:id/submit - Submit report
+ */
+router.post('/:id/submit', authenticate, async (req, res) => {
+  try {
+    const result = await ReportWorkflowService.submit(req.params.id, req.user);
+    return res.json(result);
+  } catch (err) {
+    console.error('[REPORTS/SUBMIT]', err);
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/reports/:id/request-correction - Request correction
+ */
+router.post('/:id/request-correction', authenticate, async (req, res) => {
+  const { comment } = req.body;
+  try {
+    const result = await ReportWorkflowService.requestCorrection(req.params.id, req.user, comment);
+    return res.json(result);
+  } catch (err) {
+    console.error('[REPORTS/CORRECTION]', err);
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/reports/:id/validate - Validate report
+ */
+router.post('/:id/validate', authenticate, async (req, res) => {
+  try {
+    const result = await ReportWorkflowService.validateReport(req.params.id, req.user);
+    
+    // Auto generate and store PDF
+    try {
+      await ReportPdfService.generatePdf(req.params.id);
+    } catch (pdfErr) {
+      console.error('[REPORTS/VALIDATE/PDF] Failed to generate PDF:', pdfErr);
+    }
+
+    return res.json(result);
+  } catch (err) {
+    console.error('[REPORTS/VALIDATE]', err);
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/reports/:id/reject - Reject report
+ */
+router.post('/:id/reject', authenticate, async (req, res) => {
+  const { comment } = req.body;
+  try {
+    const result = await ReportWorkflowService.reject(req.params.id, req.user, comment);
+    return res.json(result);
+  } catch (err) {
+    console.error('[REPORTS/REJECT]', err);
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/reports/:id/archive - Archive report
+ */
+router.post('/:id/archive', authenticate, async (req, res) => {
+  try {
+    const result = await ReportWorkflowService.archive(req.params.id, req.user);
+    return res.json(result);
+  } catch (err) {
+    console.error('[REPORTS/ARCHIVE]', err);
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/reports/:id/download-pdf - Download generated PDF
+ */
+router.get('/:id/download-pdf', authenticate, async (req, res) => {
+  try {
+    const access = await getReportAccess(req.params.id, req.user);
+    if (!access.report) return res.status(404).json({ error: 'Rapport introuvable.' });
+    if (!access.allowed) return res.status(403).json({ error: 'Acces refuse.' });
+
+    let finalPath = '';
+    if (access.report.pdf_path) {
+      finalPath = path.resolve(__dirname, '..', access.report.pdf_path);
+    }
+
+    if (!finalPath || !fs.existsSync(finalPath)) {
+      // Generate PDF dynamically if not present
+      finalPath = await ReportPdfService.generatePdf(req.params.id);
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="rapport-${access.report.code || req.params.id}.pdf"`);
+    return res.sendFile(finalPath);
+  } catch (err) {
+    console.error('[REPORTS/DOWNLOAD_PDF]', err);
+    return res.status(500).json({ error: 'Impossible de generer ou telecharger le PDF.' });
+  }
+});
+
+/**
+ * POST /api/reports/:id/comments - Add report comment
+ */
+router.post('/:id/comments', authenticate, async (req, res) => {
+  const { comment } = req.body;
+  if (!comment || !comment.trim()) {
+    return res.status(400).json({ error: 'Commentaire vide.' });
   }
 
   try {
@@ -192,61 +508,72 @@ router.put('/:id', authenticate, async (req, res) => {
     if (!access.report) return res.status(404).json({ error: 'Rapport introuvable.' });
     if (!access.allowed) return res.status(403).json({ error: 'Acces refuse.' });
 
-    if (!isManager(req.user)) {
-      const allowedTransition =
-        status === access.report.status ||
-        (['DRAFT', 'REJECTED'].includes(access.report.status) && ['DRAFT', 'SUBMITTED'].includes(status));
-      if (!allowedTransition) {
-        return res.status(409).json({ error: 'Transition de rapport interdite.' });
-      }
-    } else {
-      const managerTransition =
-        status === access.report.status ||
-        (access.report.status === 'DRAFT' && status === 'SUBMITTED') ||
-        (access.report.status === 'SUBMITTED' && ['VALIDATED', 'REJECTED'].includes(status)) ||
-        (access.report.status === 'REJECTED' && ['DRAFT', 'SUBMITTED'].includes(status));
-      if (!managerTransition) {
-        return res.status(409).json({ error: 'Transition de rapport interdite.' });
-      }
-    }
-
     await pool.query(
-      `UPDATE crm_reports
-       SET executive_summary = ?, administrations_visited = ?, persons_met = ?,
-           difficulties = ?, recommendations = ?, status = ?
-       WHERE id = ?`,
-      [
-        executive_summary.trim(), administrations_visited.trim(), persons_met.trim(),
-        difficulties || null, recommendations || null, status, req.params.id
-      ]
+      `INSERT INTO crm_report_comments (activity_report_id, user_id, comment)
+       VALUES (?, ?, ?)`,
+      [req.params.id, req.user.id, comment.trim()]
     );
 
-    if (status === 'SUBMITTED' && access.report.status !== 'SUBMITTED') {
-      const { notifyDirection } = require('../utils/notifications');
-      const [missionRows] = await pool.query(
-        `SELECT u.full_name, m.title AS mission_title
-         FROM crm_reports rp
-         JOIN crm_missions m ON rp.mission_id = m.id
-         JOIN users u ON m.primary_commercial_id = u.id
-         WHERE rp.id = ?`,
-        [req.params.id]
-      );
-      if (missionRows.length) {
-        await notifyDirection(
-          'Rapport Soumis',
-          `${missionRows[0].full_name} a soumis le rapport de la mission "${missionRows[0].mission_title}" pour validation.`,
-          'REPORT_SUBMITTED',
-          req.params.id
-        );
-      }
-    }
-    return res.json({ message: 'Rapport mis a jour.' });
+    return res.status(201).json({ message: 'Commentaire ajoute.' });
   } catch (err) {
-    console.error('[REPORTS/UPDATE]', err);
+    console.error('[REPORTS/ADD_COMMENT]', err);
     return res.status(500).json({ error: 'Erreur serveur.' });
   }
 });
 
+/**
+ * POST /api/reports/:id/opportunities - Link opportunity to report
+ */
+router.post('/:id/opportunities', authenticate, async (req, res) => {
+  const { opportunity_id, relation_type } = req.body;
+  if (!opportunity_id || !relation_type) {
+    return res.status(400).json({ error: 'Champs manquants.' });
+  }
+
+  try {
+    const access = await getReportAccess(req.params.id, req.user);
+    if (!access.report) return res.status(404).json({ error: 'Rapport introuvable.' });
+    if (!access.allowed) return res.status(403).json({ error: 'Acces refuse.' });
+
+    await pool.query(
+      `INSERT INTO crm_report_opportunities (activity_report_id, opportunity_id, relation_type)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE relation_type = VALUES(relation_type)`,
+      [req.params.id, Number(opportunity_id), relation_type]
+    );
+
+    return res.status(201).json({ message: 'Opportunite liee avec succes.' });
+  } catch (err) {
+    console.error('[REPORTS/LINK_OPPORTUNITY]', err);
+    return res.status(500).json({ error: 'Erreur serveur.' });
+  }
+});
+
+/**
+ * DELETE /api/reports/:id/opportunities/:oppId - Unlink opportunity from report
+ */
+router.delete('/:id/opportunities/:oppId', authenticate, async (req, res) => {
+  try {
+    const access = await getReportAccess(req.params.id, req.user);
+    if (!access.report) return res.status(404).json({ error: 'Rapport introuvable.' });
+    if (!access.allowed) return res.status(403).json({ error: 'Acces refuse.' });
+
+    await pool.query(
+      `DELETE FROM crm_report_opportunities 
+       WHERE activity_report_id = ? AND opportunity_id = ?`,
+      [req.params.id, Number(req.params.oppId)]
+    );
+
+    return res.json({ message: 'Lien opportunite supprime.' });
+  } catch (err) {
+    console.error('[REPORTS/UNLINK_OPPORTUNITY]', err);
+    return res.status(500).json({ error: 'Erreur serveur.' });
+  }
+});
+
+/**
+ * POST /api/reports/:id/attachments - Add attachment
+ */
 router.post('/:id/attachments', authenticate, upload.array('files', 5), async (req, res) => {
   try {
     const access = await getReportAccess(req.params.id, req.user);
@@ -279,6 +606,9 @@ router.post('/:id/attachments', authenticate, upload.array('files', 5), async (r
   }
 });
 
+/**
+ * GET /api/reports/:id/attachments/:attId/download - Download attachment
+ */
 router.get('/:id/attachments/:attId/download', authenticate, async (req, res) => {
   try {
     const access = await getReportAccess(req.params.id, req.user);
@@ -296,11 +626,14 @@ router.get('/:id/attachments/:attId/download', authenticate, async (req, res) =>
     }
     return res.download(path.resolve(rows[0].file_path), rows[0].file_name);
   } catch (err) {
-    console.error('[REPORTS/DOWNLOAD]', err);
+    console.error('[REPORTS/DOWNLOAD_ATTACHMENT]', err);
     return res.status(500).json({ error: 'Erreur serveur.' });
   }
 });
 
+/**
+ * DELETE /api/reports/:id/attachments/:attId - Delete attachment
+ */
 router.delete('/:id/attachments/:attId', authenticate, async (req, res) => {
   try {
     const access = await getReportAccess(req.params.id, req.user);

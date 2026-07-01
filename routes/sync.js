@@ -82,6 +82,14 @@ router.post('/push', authenticate, async (req, res) => {
       } 
       else if (type === 'report') {
         if (action === 'create') {
+          // Resolve local mission_id if created offline in same sync session
+          if (payload.mission_id && localToServerIdMap.has(payload.mission_id)) {
+            payload.mission_id = localToServerIdMap.get(payload.mission_id);
+          }
+          if (payload.institution_id && localToServerIdMap.has(payload.institution_id)) {
+            payload.institution_id = localToServerIdMap.get(payload.institution_id);
+          }
+
           // Check if report already exists for this mission
           const [existing] = await pool.query('SELECT id FROM crm_reports WHERE mission_id = ?', [payload.mission_id]);
           if (existing.length > 0) {
@@ -103,45 +111,239 @@ router.post('/push', authenticate, async (req, res) => {
             continue;
           }
 
-          // Insert report
-          const [resInsert] = await pool.query(
-            'INSERT INTO crm_reports (mission_id, executive_summary, administrations_visited, persons_met, difficulties, recommendations, status) VALUES (?, ?, ?, ?, ?, ?, "SUBMITTED")',
-            [
-              payload.mission_id,
-              payload.executive_summary,
-              payload.administrations_visited,
-              payload.persons_met,
-              payload.difficulties || null,
-              payload.recommendations || null
-            ]
-          );
+          // Insert report transactionally
+          const conn = await pool.getConnection();
+          try {
+            await conn.beginTransaction();
 
-          // Mark mission as completed
-          await pool.query('UPDATE crm_missions SET status = "COMPLETED" WHERE id = ?', [payload.mission_id]);
+            const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+            const [resInsert] = await conn.query(
+              `INSERT INTO crm_reports (
+                report_type, mission_id, objective_id, institution_id,
+                commercial_id, period_start, period_end, status,
+                executive_summary, results, diagnosis, difficulties,
+                recommendations, next_steps, generated_from, generated_by, persons_met
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mobile', ?, ?)`,
+              [
+                payload.report_type || 'activity_report',
+                payload.mission_id ? Number(payload.mission_id) : null,
+                payload.objective_id ? Number(payload.objective_id) : null,
+                payload.institution_id ? Number(payload.institution_id) : null,
+                req.user.id,
+                payload.period_start || null,
+                payload.period_end || null,
+                payload.status || 'A_COMPLETER',
+                (payload.executive_summary || '').trim(),
+                (payload.results || '').trim(),
+                (payload.diagnosis || '').trim(),
+                (payload.difficulties || '').trim(),
+                (payload.recommendations || '').trim(),
+                (payload.next_steps || '').trim(),
+                req.user.id,
+                typeof payload.persons_met === 'object' ? JSON.stringify(payload.persons_met) : (payload.persons_met || '')
+              ]
+            );
 
-          // Insert files if present
-          if (payload.files && payload.files.length > 0) {
-            for (const f of payload.files) {
-              await pool.query(
-                'INSERT INTO crm_report_attachments (report_id, file_name, file_path, file_size) VALUES (?, ?, ?, ?)',
-                [resInsert.insertId, f.name, f.path || `/ged/crm/reports/${f.name}`, f.size || 1024]
-              );
+            const reportId = resInsert.insertId;
+            const code = `RAP-${dateStr}-${String(reportId).padStart(4, '0')}`;
+            await conn.query('UPDATE crm_reports SET code = ? WHERE id = ?', [code, reportId]);
+
+            // Mark mission as completed
+            if (payload.mission_id) {
+              await conn.query('UPDATE crm_missions SET status = "COMPLETED" WHERE id = ?', [payload.mission_id]);
             }
+
+            // Insert opportunities
+            if (Array.isArray(payload.opportunities)) {
+              for (const opp of payload.opportunities) {
+                let oppId = opp.id;
+                if (opp.title && isNaN(Number(opp.id))) {
+                  const doubleValidationRequired = parseFloat(opp.estimated_amount) > 50000000;
+                  const initialStatus = doubleValidationRequired ? 'SUBMITTED' : 'DETECTED';
+
+                  const [oppInsert] = await conn.query(
+                    `INSERT INTO crm_opportunities (
+                      institution_id, title, need_description, estimated_amount, priority, status, pipeline_stage, assigned_to
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                      payload.institution_id ? Number(payload.institution_id) : null,
+                      opp.title,
+                      opp.need_description || null,
+                      opp.estimated_amount || 0,
+                      opp.priority || 'MEDIUM',
+                      initialStatus,
+                      opp.pipeline_stage || 'DETECTION',
+                      req.user.id
+                    ]
+                  );
+                  oppId = oppInsert.insertId;
+                }
+
+                if (oppId) {
+                  await conn.query(
+                    'INSERT INTO crm_report_opportunities (activity_report_id, opportunity_id, relation_type) VALUES (?, ?, ?)',
+                    [reportId, Number(oppId), opp.relation_type || 'PRIMARY']
+                  );
+                }
+              }
+            }
+
+            await conn.commit();
+            successCount++;
+            localToServerIdMap.set(localId, reportId);
+            results.push({ localId, status: 'success', serverId: reportId });
+            syncHistoryDetails.push(`Rapport créé via synchro pour mission #${payload.mission_id} (ID: ${reportId})`);
+
+            // Notify direction
+            const [mRows] = await pool.query('SELECT title FROM crm_missions WHERE id = ?', [payload.mission_id]);
+            const mTitle = mRows.length ? mRows[0].title : `Mission #${payload.mission_id}`;
+            await notifyDirection(
+              'Rapport Soumis (Synchro)',
+              `${req.user.full_name} a soumis un rapport pour la mission "${mTitle}".`,
+              'REPORT_SUBMITTED',
+              reportId
+            );
+          } catch (txErr) {
+            await conn.rollback();
+            console.error('TX Error inserting report during sync:', txErr);
+            errorCount++;
+            results.push({ localId, status: 'error', message: 'Erreur transactionnelle sur le serveur.' });
+          } finally {
+            conn.release();
+          }
+        } else if (action === 'update') {
+          // Check for conflict
+          const [existing] = await pool.query('SELECT id, updated_at, status FROM crm_reports WHERE id = ?', [payload.id]);
+          if (existing.length === 0) {
+            errorCount++;
+            results.push({ localId, status: 'error', message: "Rapport introuvable sur le serveur." });
+            continue;
           }
 
-          successCount++;
-          results.push({ localId, status: 'success', serverId: resInsert.insertId });
-          syncHistoryDetails.push(`Rapport créé via synchro pour mission #${payload.mission_id}`);
+          const serverRecord = existing[0];
+          const clientUpdatedAt = new Date(payload.updated_at || Date.now());
+          const serverUpdatedAt = new Date(serverRecord.updated_at);
 
-          // Notify direction
-          const [mRows] = await pool.query('SELECT title FROM crm_missions WHERE id = ?', [payload.mission_id]);
-          const mTitle = mRows.length ? mRows[0].title : `Mission #${payload.mission_id}`;
-          await notifyDirection(
-            'Rapport Soumis (Synchro)',
-            `${req.user.full_name} a soumis un rapport pour la mission "${mTitle}".`,
-            'REPORT_SUBMITTED',
-            resInsert.insertId
-          );
+          // Conflict check
+          if (serverUpdatedAt > clientUpdatedAt && serverRecord.status !== payload.status) {
+            conflictCount++;
+            const [resConflict] = await pool.query(
+              'INSERT INTO crm_sync_conflicts (user_id, record_type, record_id, local_data, server_data, resolution_choice) VALUES (?, ?, ?, ?, ?, ?)',
+              [req.user.id, 'report', serverRecord.id, JSON.stringify(payload), JSON.stringify(serverRecord), 'KEEP_SERVER']
+            );
+            results.push({
+              localId,
+              status: 'conflict',
+              conflictId: resConflict.insertId,
+              recordId: serverRecord.id,
+              serverData: serverRecord,
+              message: 'Le rapport a été modifié sur le serveur.'
+            });
+            syncHistoryDetails.push(`Conflit rapport: #${payload.id} modifié sur le serveur.`);
+            continue;
+          }
+
+          const conn = await pool.getConnection();
+          try {
+            await conn.beginTransaction();
+
+            await conn.query(
+              `UPDATE crm_reports
+               SET executive_summary = ?, 
+                   results = ?, 
+                   diagnosis = ?, 
+                   difficulties = ?, 
+                   recommendations = ?, 
+                   next_steps = ?,
+                   institution_id = ?, 
+                   objective_id = ?,
+                   period_start = ?,
+                   period_end = ?,
+                   persons_met = ?,
+                   status = CASE WHEN status = 'BROUILLON_AUTO' THEN 'A_COMPLETER' ELSE status END
+               WHERE id = ?`,
+              [
+                (payload.executive_summary || '').trim(),
+                (payload.results || '').trim(),
+                (payload.diagnosis || '').trim(),
+                (payload.difficulties || '').trim(),
+                (payload.recommendations || '').trim(),
+                (payload.next_steps || '').trim(),
+                payload.institution_id ? Number(payload.institution_id) : serverRecord.institution_id,
+                payload.objective_id ? Number(payload.objective_id) : serverRecord.objective_id,
+                payload.period_start || serverRecord.period_start,
+                payload.period_end || serverRecord.period_end,
+                typeof payload.persons_met === 'object' ? JSON.stringify(payload.persons_met) : (payload.persons_met || ''),
+                payload.id
+              ]
+            );
+
+            // Handle opportunities links/creation
+            if (Array.isArray(payload.opportunities)) {
+              const [existingLinks] = await conn.query(
+                'SELECT opportunity_id FROM crm_report_opportunities WHERE activity_report_id = ?',
+                [payload.id]
+              );
+              const existingOppIds = new Set(existingLinks.map(l => l.opportunity_id));
+              const keepOppIds = new Set();
+
+              for (const opp of payload.opportunities) {
+                let oppId = opp.id;
+                if (opp.title && isNaN(Number(opp.id))) {
+                  const doubleValidationRequired = parseFloat(opp.estimated_amount) > 50000000;
+                  const initialStatus = doubleValidationRequired ? 'SUBMITTED' : 'DETECTED';
+
+                  const [oppInsert] = await conn.query(
+                    `INSERT INTO crm_opportunities (
+                      institution_id, title, need_description, estimated_amount, priority, status, pipeline_stage, assigned_to
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                      payload.institution_id ? Number(payload.institution_id) : serverRecord.institution_id,
+                      opp.title,
+                      opp.need_description || null,
+                      opp.estimated_amount || 0,
+                      opp.priority || 'MEDIUM',
+                      initialStatus,
+                      opp.pipeline_stage || 'DETECTION',
+                      req.user.id
+                    ]
+                  );
+                  oppId = oppInsert.insertId;
+                }
+
+                if (oppId) {
+                  keepOppIds.add(Number(oppId));
+                  await conn.query(
+                    `INSERT INTO crm_report_opportunities (activity_report_id, opportunity_id, relation_type)
+                     VALUES (?, ?, ?)
+                     ON DUPLICATE KEY UPDATE relation_type = VALUES(relation_type)`,
+                    [payload.id, Number(oppId), opp.relation_type || 'PRIMARY']
+                  );
+                }
+              }
+
+              for (const oldId of existingOppIds) {
+                if (!keepOppIds.has(oldId)) {
+                  await conn.query(
+                    'DELETE FROM crm_report_opportunities WHERE activity_report_id = ? AND opportunity_id = ?',
+                    [payload.id, oldId]
+                  );
+                }
+              }
+            }
+
+            await conn.commit();
+            successCount++;
+            results.push({ localId, status: 'success' });
+            syncHistoryDetails.push(`Rapport mis à jour via synchro: #${payload.id}`);
+          } catch (txErr) {
+            await conn.rollback();
+            console.error('TX Error updating report during sync:', txErr);
+            errorCount++;
+            results.push({ localId, status: 'error', message: 'Erreur transactionnelle sur le serveur.' });
+          } finally {
+            conn.release();
+          }
         }
       } 
       else if (type === 'opportunity') {

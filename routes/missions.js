@@ -7,6 +7,7 @@ const path = require('path');
 const pool = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 const multer = require('multer');
+const ReportWorkflowService = require('../services/reportWorkflow');
 
 const router = express.Router();
 
@@ -578,8 +579,13 @@ router.get('/:id/order.pdf', authenticate, async (req, res) => {
     const pageCount = doc.bufferedPageRange().count;
     for (let i = 0; i < pageCount; i += 1) {
       doc.switchToPage(i);
+      doc.save();
+      doc.moveTo(54, 795).lineTo(541, 795).strokeColor('#cbd5e1').lineWidth(0.5).stroke();
+      doc.restore();
       doc.font('Helvetica').fontSize(8).fillColor('#64748b')
-        .text(`Genere le ${formatDateTime(new Date())} - Page ${i + 1}/${pageCount}`, 54, 806, { align: 'center', width: 487 });
+        .text(`ERP Remontada Prospectia — Document confidentiel`, 54, 804, { align: 'left', width: 240 });
+      doc.font('Helvetica').fontSize(8).fillColor('#64748b')
+        .text(`Page ${i + 1} / ${pageCount}`, 300, 804, { align: 'right', width: 241 });
     }
 
     doc.end();
@@ -862,6 +868,16 @@ router.post('/:id/actions', authenticate, async (req, res) => {
     }
 
     await pool.query(query, params);
+
+    // Auto-generate report draft if mission was completed
+    if (normalizedAction === 'COMPLETE') {
+      try {
+        await ReportWorkflowService.generateFromMission(req.params.id, req.user.id);
+      } catch (genErr) {
+        console.error('[MISSIONS/ACTION/AUTO_REPORT] Error generating draft:', genErr);
+      }
+    }
+
     return res.json({ message });
   } catch (err) {
     console.error('[MISSIONS/ACTION]', err);
