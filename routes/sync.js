@@ -52,15 +52,15 @@ router.post('/push', authenticate, async (req, res) => {
             `INSERT INTO crm_institutions (name, type, tax_id, address, region_id, department_id, city_id, phone, email, website, created_by) 
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
-              payload.name, 
-              payload.type || 'PROSPECT', 
-              payload.tax_id || null, 
-              payload.address || null, 
-              payload.region_id || 1, 
-              payload.department_id || 1, 
-              payload.city_id || 1, 
-              payload.phone || null, 
-              payload.email || null, 
+              payload.name,
+              payload.type || 'PROSPECT',
+              payload.tax_id || null,
+              payload.address || null,
+              payload.region_id || 1,
+              payload.department_id || 1,
+              payload.city_id || 1,
+              payload.phone || null,
+              payload.email || null,
               payload.website || null,
               req.user.id
             ]
@@ -79,7 +79,7 @@ router.post('/push', authenticate, async (req, res) => {
             resInsert.insertId
           );
         }
-      } 
+      }
       else if (type === 'report') {
         if (action === 'create') {
           // Resolve local mission_id if created offline in same sync session
@@ -345,7 +345,7 @@ router.post('/push', authenticate, async (req, res) => {
             conn.release();
           }
         }
-      } 
+      }
       else if (type === 'opportunity') {
         if (action === 'create') {
           // Résoudre les identifiants locaux s'ils ont été créés lors de la même session offline
@@ -385,7 +385,7 @@ router.post('/push', authenticate, async (req, res) => {
             'OPPORTUNITY_CREATED',
             resInsert.insertId
           );
-        } 
+        }
         else if (action === 'update') {
           // Check for conflict
           const [existing] = await pool.query('SELECT id, updated_at, pipeline_stage FROM crm_opportunities WHERE id = ?', [payload.id]);

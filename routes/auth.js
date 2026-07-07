@@ -68,7 +68,8 @@ function publicUser(user) {
     role: user.role,
     job_title: user.job_title,
     avatar_url: user.avatar_url,
-    settings: settings
+    settings: settings,
+    mfa_enabled: Boolean(user.mfa_enabled)
   };
 }
 

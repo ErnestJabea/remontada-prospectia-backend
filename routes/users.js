@@ -35,7 +35,7 @@ router.get('/', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (
     const [rows] = await pool.query(
       `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
               u.email, u.phone, u.role, u.job_description_id, u.is_active,
-              u.is_verified, u.last_login, u.created_at,
+              u.is_verified, u.last_login, u.created_at, u.mfa_enabled,
               jd.title AS job_title, jd.role_category
        FROM users u
        LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
@@ -53,7 +53,7 @@ router.get('/commercials', authenticate, async (req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
-              u.email, u.phone, u.role, u.is_active, u.last_login,
+              u.email, u.phone, u.role, u.is_active, u.last_login, u.mfa_enabled,
               jd.title AS job_title
        FROM users u
        LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
@@ -90,7 +90,7 @@ router.get('/:id', authenticate, async (req, res) => {
     const [rows] = await pool.query(
       `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
               u.email, u.phone, u.role, u.is_active, u.is_verified,
-              u.last_login, u.created_at, u.avatar_url,
+              u.last_login, u.created_at, u.avatar_url, u.mfa_enabled,
               jd.id AS job_description_id, jd.title AS job_title, jd.role_category
        FROM users u
        LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id

@@ -23,14 +23,145 @@ function formatDate(value) {
   });
 }
 
+function normalizeCode(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function formatReportStatus(value) {
+  const labels = {
+    BROUILLON_AUTO: 'Brouillon automatique',
+    A_COMPLETER: 'A completer',
+    DRAFT: 'Brouillon',
+    SUBMITTED: 'Soumis',
+    SOUMIS: 'Soumis',
+    EN_VALIDATION: 'En validation',
+    CORRECTION_DEMANDEE: 'Correction demandee',
+    VALIDATED: 'Valide',
+    VALIDE: 'Valide',
+    REJECTED: 'Rejete',
+    REJETE: 'Rejete',
+    ARCHIVED: 'Archive',
+    ARCHIVE: 'Archive'
+  };
+  const code = normalizeCode(value);
+  return labels[code] || humanizeValue(value) || '-';
+}
+
+function formatOpportunityStatus(value) {
+  const labels = {
+    DETECTED: 'Detectee',
+    SUBMITTED: 'Soumise',
+    TO_CORRECT: 'A corriger',
+    VALIDATED: 'Validee',
+    REJECTED: 'Rejetee',
+    ANALYSIS: 'Analyse',
+    ACTION_PLAN: 'Plan d action',
+    PROPOSAL: 'Proposition',
+    NEGOTIATION: 'Negociation',
+    DECISION: 'Decision',
+    WON: 'Gagnee',
+    LOST: 'Perdue',
+    ARCHIVED: 'Archivee'
+  };
+  const code = normalizeCode(value);
+  return labels[code] || humanizeValue(value) || '-';
+}
+
+function formatPriority(value) {
+  const labels = {
+    LOW: 'Faible',
+    MEDIUM: 'Moyenne',
+    HIGH: 'Forte',
+    CRITICAL: 'Critique'
+  };
+  const code = normalizeCode(value);
+  return labels[code] || humanizeValue(value) || '-';
+}
+
+function formatRelationType(value) {
+  const labels = {
+    PRIMARY: 'Principal',
+    SECONDARY: 'Secondaire',
+    FOLLOW_UP: 'Suivi'
+  };
+  const code = normalizeCode(value);
+  return labels[code] || humanizeValue(value) || '-';
+}
+
 function ensurePdfSpace(doc, minHeight = 100) {
   if (doc.y > 760 - minHeight) doc.addPage();
 }
 
+function humanizeKey(key) {
+  const labels = {
+    name: 'Nom',
+    phone: 'Telephone',
+    email: 'Email',
+    role: 'Role',
+    job_title: 'Fonction',
+    title: 'Titre',
+    estimated_amount: 'Montant estime',
+    priority: 'Priorite',
+    need_description: 'Besoin',
+    relation_type: 'Lien'
+  };
+  return labels[key] || String(key || '').replace(/_/g, ' ');
+}
+
+function humanizeValue(value) {
+  if (value == null || value === '') return '';
+  if (Array.isArray(value)) return value.map(humanizeValue).filter(Boolean).join(', ');
+  if (typeof value === 'object') return formatObjectForPdf(value).replace(/\n/g, ' ; ');
+  return String(value).replace(/_/g, ' ').trim();
+}
+
+function parseJsonContent(content) {
+  if (typeof content !== 'string') return content;
+  const trimmed = content.trim();
+  if (!trimmed || !/^[\[{]/.test(trimmed)) return content;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return content;
+  }
+}
+
+function softWrapLongTokens(text) {
+  return String(text || '').replace(/\S{42,}/g, token => token.match(/.{1,36}/g).join(' '));
+}
+
+function formatObjectForPdf(obj) {
+  return Object.entries(obj || {})
+    .filter(([key, value]) => key !== 'id' && humanizeValue(value))
+    .map(([key, value]) => `${humanizeKey(key)} : ${humanizeValue(value)}`)
+    .join(' | ');
+}
+
+function formatContentForPdf(content) {
+  const parsed = parseJsonContent(content);
+
+  if (Array.isArray(parsed)) {
+    if (!parsed.length) return '';
+    return parsed
+      .map(item => {
+        if (item && typeof item === 'object') return `- ${formatObjectForPdf(item)}`;
+        return `- ${humanizeValue(item)}`;
+      })
+      .filter(line => line.trim() !== '-')
+      .join('\n');
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    return formatObjectForPdf(parsed);
+  }
+
+  return softWrapLongTokens(String(parsed || '').trim());
+}
+
 function addPdfSection(doc, title) {
   doc.moveDown(1.2);
-  const y = doc.y;
   ensurePdfSpace(doc, 40);
+  const y = doc.y;
 
   // Left vertical red accent bar
   doc.save();
@@ -44,15 +175,25 @@ function addPdfSection(doc, title) {
 function drawMetadataGrid(doc, fields) {
   const startX = 54;
   const colWidth = 240;
-  const rowHeight = 20;
+  const labelWidth = 95;
+  const valueWidth = 135;
+  const minRowHeight = 20;
   doc.save();
 
   for (let i = 0; i < fields.length; i += 2) {
-    const y = doc.y;
-    ensurePdfSpace(doc, rowHeight + 4);
-
     const f1 = fields[i];
     const f2 = fields[i + 1];
+    const value1 = formatContentForPdf(f1?.value) || '-';
+    const value2 = formatContentForPdf(f2?.value) || '-';
+    const rowContentHeight = Math.max(
+      f1 ? doc.heightOfString(value1, { width: valueWidth }) : 0,
+      f2 ? doc.heightOfString(value2, { width: valueWidth }) : 0,
+      minRowHeight - 10
+    );
+    const rowHeight = Math.max(minRowHeight, rowContentHeight + 12);
+
+    ensurePdfSpace(doc, rowHeight + 4);
+    const y = doc.y;
 
     // Draw subtle horizontal separator line
     if (i > 0) {
@@ -61,14 +202,14 @@ function drawMetadataGrid(doc, fields) {
 
     // Draw first field
     if (f1) {
-      doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#64748b').text(f1.label, startX, y + 5, { width: 95 });
-      doc.font('Helvetica').fontSize(8.5).fillColor('#0f172a').text(String(f1.value || '-'), startX + 100, y + 5, { width: 135 });
+      doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#64748b').text(f1.label, startX, y + 5, { width: labelWidth });
+      doc.font('Helvetica').fontSize(8.5).fillColor('#0f172a').text(value1, startX + 100, y + 5, { width: valueWidth });
     }
 
     // Draw second field
     if (f2) {
-      doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#64748b').text(f2.label, startX + colWidth + 5, y + 5, { width: 95 });
-      doc.font('Helvetica').fontSize(8.5).fillColor('#0f172a').text(String(f2.value || '-'), startX + colWidth + 100, y + 5, { width: 135 });
+      doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#64748b').text(f2.label, startX + colWidth + 5, y + 5, { width: labelWidth });
+      doc.font('Helvetica').fontSize(8.5).fillColor('#0f172a').text(value2, startX + colWidth + 100, y + 5, { width: valueWidth });
     }
 
     doc.y = y + rowHeight;
@@ -79,7 +220,8 @@ function drawMetadataGrid(doc, fields) {
 }
 
 function drawContentBlock(doc, title, content) {
-  if (!content || !content.trim()) return;
+  const formattedContent = formatContentForPdf(content);
+  if (!formattedContent) return;
   ensurePdfSpace(doc, 50);
 
   doc.font('Helvetica-Bold').fontSize(9).fillColor('#475569').text(title);
@@ -89,7 +231,7 @@ function drawContentBlock(doc, title, content) {
   doc.font('Helvetica').fontSize(9).fillColor('#1e293b');
 
   // Indent text by 10 points
-  doc.text(content, 64, yStart, { width: 477, align: 'justify' });
+  doc.text(formattedContent, 64, yStart, { width: 477, align: 'left' });
   const yEnd = doc.y;
 
   // Draw a nice grey vertical border line on the left side of the indented block
@@ -177,10 +319,11 @@ class ReportPdfService {
     doc.moveDown(0.2);
 
     // Status text block (no background, colored font)
-    const statusText = `Statut : ${report.status}`;
-    const statusColor = (report.status === 'VALIDE' || report.status === 'VALIDATED') 
+    const reportStatusCode = normalizeCode(report.status);
+    const statusText = `Statut : ${formatReportStatus(report.status)}`;
+    const statusColor = (reportStatusCode === 'VALIDE' || reportStatusCode === 'VALIDATED') 
       ? '#047857' 
-      : (['REJETE', 'REJECTED', 'CORRECTION_DEMANDEE'].includes(report.status) ? '#b91c1c' : '#d97706');
+      : (['REJETE', 'REJECTED', 'CORRECTION_DEMANDEE'].includes(reportStatusCode) ? '#b91c1c' : '#d97706');
     doc.fillColor(statusColor).font('Helvetica-Bold').fontSize(11).text(statusText.toUpperCase(), 54, 142, { align: 'center' });
     
     doc.y = 165;
@@ -257,7 +400,7 @@ class ReportPdfService {
 
         doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#0f172a').text(opp.title, 64, y + 6, { width: 467 });
         doc.font('Helvetica').fontSize(7.5).fillColor('#475569')
-          .text(`Lien: ${opp.relation_type.toUpperCase()}  |  Montant: ${Number(opp.estimated_amount).toLocaleString('fr-FR')} XAF  |  Priorité: ${opp.priority}  |  Statut: ${opp.status}`, 64, y + 21);
+          .text(`Lien: ${formatRelationType(opp.relation_type)}  |  Montant: ${Number(opp.estimated_amount).toLocaleString('fr-FR')} XAF  |  Priorite: ${formatPriority(opp.priority)}  |  Statut: ${formatOpportunityStatus(opp.status)}`, 64, y + 21);
 
         doc.y = y + 46;
       });
@@ -284,13 +427,14 @@ class ReportPdfService {
     const pageCount = doc.bufferedPageRange().count;
     for (let i = 0; i < pageCount; i += 1) {
       doc.switchToPage(i);
+      doc.page.margins.bottom = 20;
       doc.save();
       doc.moveTo(54, 795).lineTo(541, 795).strokeColor('#cbd5e1').lineWidth(0.5).stroke();
       doc.restore();
       doc.font('Helvetica').fontSize(8).fillColor('#64748b')
-        .text(`ERP Remontada Prospectia — Document confidentiel`, 54, 804, { align: 'left', width: 240 });
+        .text(`ERP Remontada Prospectia - Document confidentiel`, 54, 804, { align: 'left', width: 240, lineBreak: false });
       doc.font('Helvetica').fontSize(8).fillColor('#64748b')
-        .text(`Page ${i + 1} / ${pageCount}`, 300, 804, { align: 'right', width: 241 });
+        .text(`Page ${i + 1} / ${pageCount}`, 300, 804, { align: 'right', width: 241, lineBreak: false });
     }
 
     doc.end();

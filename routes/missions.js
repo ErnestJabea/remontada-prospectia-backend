@@ -398,9 +398,9 @@ router.get('/:id', authenticate, async (req, res) => {
        ORDER BY created_at DESC`,
       [req.params.id]
     );
-    return res.json({ 
-      ...rows[0], 
-      associates, 
+    return res.json({
+      ...rows[0],
+      associates,
       report: reports[0] || null,
       attachments
     });
