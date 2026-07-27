@@ -330,19 +330,22 @@ router.post('/', authenticate, async (req, res) => {
  */
 router.put('/:id', authenticate, async (req, res) => {
   const { title, need_description, estimated_amount, priority, assigned_to } = req.body;
-  if (
-    typeof title !== 'string' || !title.trim() || title.length > 150 ||
-    typeof need_description !== 'string' || !need_description.trim() ||
-    !Number.isFinite(Number(estimated_amount)) || Number(estimated_amount) <= 0 ||
-    !PRIORITIES.includes(priority)
-  ) {
-    return res.status(400).json({ error: 'Données d\'opportunité invalides.' });
-  }
 
   try {
     const opportunity = await getOpportunity(req.params.id);
     if (!opportunity) return res.status(404).json({ error: 'Opportunité introuvable.' });
     if (!canAccess(opportunity, req.user)) return res.status(403).json({ error: 'Accès refusé.' });
+
+    const finalPriority = priority || opportunity.priority || 'MEDIUM';
+
+    if (
+      typeof title !== 'string' || !title.trim() || title.length > 150 ||
+      typeof need_description !== 'string' || !need_description.trim() ||
+      !Number.isFinite(Number(estimated_amount)) || Number(estimated_amount) <= 0 ||
+      !PRIORITIES.includes(finalPriority)
+    ) {
+      return res.status(400).json({ error: 'Données d\'opportunité invalides.' });
+    }
 
     // Un commercial ne peut modifier que si elle est détectée ou nécessite correction
     if (req.user.role === 'COMMERCIAL' && opportunity.status !== 'DETECTED' && opportunity.status !== 'TO_CORRECT') {
@@ -357,7 +360,7 @@ router.put('/:id', authenticate, async (req, res) => {
       `UPDATE crm_opportunities
        SET title = ?, need_description = ?, estimated_amount = ?, priority = ?, assigned_to = ?
        WHERE id = ?`,
-      [title.trim(), need_description.trim(), Number(estimated_amount), priority, assignedTo, req.params.id]
+      [title.trim(), need_description.trim(), Number(estimated_amount), finalPriority, assignedTo, req.params.id]
     );
 
     return res.json({ message: 'Opportunité mise à jour.' });

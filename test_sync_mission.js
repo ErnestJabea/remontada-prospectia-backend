@@ -3,7 +3,7 @@
  * Run: node backend/test_sync_mission.js
  */
 const pool = require('./db');
-const fetch = require('node-fetch'); // Let's use node-fetch or simulate the request via calling the router.
+// const fetch = require('node-fetch'); // Let's use node-fetch or simulate the request via calling the router.
 // Alternatively, since the server is running on port 3002, we can make an actual HTTP request.
 // But first, let's get a token or bypass auth for testing, or use credentials.
 
@@ -105,9 +105,13 @@ async function runTest() {
         check_in_latitude = COALESCE(check_in_latitude, ?),
         check_in_longitude = COALESCE(check_in_longitude, ?)
        WHERE id = ?`;
+      const dateStr = payload.check_in_at || new Date().toISOString();
+      const parsedDate = new Date(dateStr);
+      const mysqlDate = isNaN(parsedDate.getTime()) ? new Date().toISOString().slice(0, 19).replace('T', ' ') : parsedDate.toISOString().slice(0, 19).replace('T', ' ');
+
       missionUpdateParams = [
-        payload.check_in_at || new Date().toISOString(),
-        payload.check_in_at || new Date().toISOString(),
+        mysqlDate,
+        mysqlDate,
         payload.check_in_location?.latitude || null,
         payload.check_in_location?.longitude || null,
         resolvedMissionId

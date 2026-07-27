@@ -67,9 +67,12 @@ const limiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Trop de requetes. Reessayez dans 15 minutes.' }
 });
-// Desactive temporairement en local pour eviter les blocages pendant les tests.
-// A reactiver avant la mise en production.
-// app.use('/api/', limiter);
+const disableApiRateLimit = process.env.API_RATE_LIMIT_DISABLED === 'true' && process.env.NODE_ENV !== 'production';
+if (disableApiRateLimit) {
+  console.warn('[SECURITY] Rate limiting API desactive hors production via API_RATE_LIMIT_DISABLED=true.');
+} else {
+  app.use('/api/', limiter);
+}
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -144,4 +147,3 @@ app.listen(PORT, () => {
 
 module.exports = app;
 // reload crm cnf, routes, and mailer
-

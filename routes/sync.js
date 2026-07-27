@@ -388,7 +388,7 @@ router.post('/push', authenticate, async (req, res) => {
         }
         else if (action === 'update') {
           // Check for conflict
-          const [existing] = await pool.query('SELECT id, updated_at, pipeline_stage FROM crm_opportunities WHERE id = ?', [payload.id]);
+          const [existing] = await pool.query('SELECT * FROM crm_opportunities WHERE id = ?', [payload.id]);
           if (existing.length === 0) {
             errorCount++;
             results.push({ localId, status: 'error', message: "Opportunité introuvable sur le serveur." });
@@ -400,7 +400,7 @@ router.post('/push', authenticate, async (req, res) => {
           const serverUpdatedAt = new Date(serverRecord.updated_at);
 
           // If server was updated AFTER client checked out, conflict!
-          if (serverUpdatedAt > clientUpdatedAt && serverRecord.pipeline_stage !== payload.pipeline_stage) {
+          if (serverUpdatedAt > clientUpdatedAt && payload.pipeline_stage !== undefined && serverRecord.pipeline_stage !== payload.pipeline_stage) {
             conflictCount++;
             const [resConflict] = await pool.query(
               'INSERT INTO crm_sync_conflicts (user_id, record_type, record_id, local_data, server_data, resolution_choice) VALUES (?, ?, ?, ?, ?, ?)',
@@ -419,19 +419,29 @@ router.post('/push', authenticate, async (req, res) => {
           }
 
           // No conflict, perform update
+          const pipeline_stage = payload.pipeline_stage !== undefined ? payload.pipeline_stage : serverRecord.pipeline_stage;
+          const status = payload.status !== undefined ? payload.status : serverRecord.status;
+          const title = payload.title !== undefined ? payload.title : serverRecord.title;
+          const need_description = payload.need_description !== undefined ? payload.need_description : serverRecord.need_description;
+          const estimated_amount = payload.estimated_amount !== undefined ? payload.estimated_amount : serverRecord.estimated_amount;
+          const priority = payload.priority !== undefined ? payload.priority : serverRecord.priority;
+          const assigned_to = payload.assigned_to !== undefined ? payload.assigned_to : serverRecord.assigned_to;
+
           await pool.query(
-            'UPDATE crm_opportunities SET pipeline_stage = ?, status = ? WHERE id = ?',
-            [payload.pipeline_stage, payload.status || 'DETECTED', payload.id]
+            `UPDATE crm_opportunities 
+             SET pipeline_stage = ?, status = ?, title = ?, need_description = ?, estimated_amount = ?, priority = ?, assigned_to = ?
+             WHERE id = ?`,
+            [pipeline_stage, status, title, need_description, estimated_amount, priority, assigned_to, payload.id]
           );
 
           successCount++;
           results.push({ localId, status: 'success' });
-          syncHistoryDetails.push(`Opportunité mise à jour: #${payload.id} vers ${payload.pipeline_stage}`);
+          syncHistoryDetails.push(`Opportunité mise à jour: #${payload.id} vers ${pipeline_stage}`);
 
           // Notify direction
           await notifyDirection(
             'Pipeline opportunité mis à jour (Synchro)',
-            `${req.user.full_name} a mis à jour l'opportunité "${payload.title}" vers l'étape "${payload.pipeline_stage}".`,
+            `${req.user.full_name} a mis à jour l'opportunité "${title}" vers l'étape "${pipeline_stage}".`,
             'OPPORTUNITY_UPDATED',
             payload.id
           );

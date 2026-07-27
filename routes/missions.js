@@ -687,7 +687,7 @@ router.post('/', authenticate, async (req, res) => {
         Math.min(Math.max(Number(duration_hours) || 2, 1), 72),
         primaryCommercialId, region_id, department_id, city_id,
         mission_type || 'PROSPECTION',
-        STRATEGIC_OBJECTIVES.includes(strategic_objective) ? strategic_objective : 'IDENTIFIER_BESOIN',
+        strategic_objective || 'IDENTIFIER_BESOIN',
         expected_result || null,
         target_decision_maker || null,
         target_technical_prescriber || null,
@@ -761,7 +761,7 @@ router.put('/:id/status', authenticate, async (req, res) => {
 });
 
 router.post('/:id/actions', authenticate, async (req, res) => {
-  const { action, reason, scheduled_date } = req.body;
+  const { action, reason, scheduled_date, check_in_at, check_in_latitude, check_in_longitude } = req.body;
   const normalizedAction = String(action || '').toUpperCase();
 
   try {
@@ -825,8 +825,25 @@ router.post('/:id/actions', authenticate, async (req, res) => {
       if (!['PLANNED', 'POSTPONED'].includes(mission.status)) {
         return res.status(409).json({ error: 'La mission doit etre planifiee avant execution.' });
       }
-      query = "UPDATE crm_missions SET status = 'IN_PROGRESS', started_at = COALESCE(started_at, NOW()) WHERE id = ?";
-      params = [req.params.id];
+
+      const checkInDate = check_in_at ? new Date(check_in_at) : new Date();
+      const checkInMysql = isNaN(checkInDate.getTime()) ? new Date() : checkInDate;
+      const formattedCheckIn = checkInMysql.toISOString().slice(0, 19).replace('T', ' ');
+
+      query = `UPDATE crm_missions SET 
+        status = 'IN_PROGRESS', 
+        started_at = COALESCE(started_at, ?),
+        check_in_at = COALESCE(check_in_at, ?),
+        check_in_latitude = COALESCE(check_in_latitude, ?),
+        check_in_longitude = COALESCE(check_in_longitude, ?)
+       WHERE id = ?`;
+      params = [
+        formattedCheckIn,
+        formattedCheckIn,
+        check_in_latitude !== undefined && check_in_latitude !== null ? Number(check_in_latitude) : null,
+        check_in_longitude !== undefined && check_in_longitude !== null ? Number(check_in_longitude) : null,
+        req.params.id
+      ];
       message = 'Mission demarree.';
     } else if (normalizedAction === 'COMPLETE') {
       if (!executable) return res.status(403).json({ error: 'Execution reservee aux personnes affectees a la mission.' });
@@ -923,7 +940,7 @@ router.put('/:id', authenticate, async (req, res) => {
         Math.min(Math.max(Number(duration_hours) || 2, 1), 72),
         institution_id, region_id, department_id, city_id,
         mission_type || access.mission.mission_type || 'PROSPECTION',
-        STRATEGIC_OBJECTIVES.includes(strategic_objective) ? strategic_objective : access.mission.strategic_objective,
+        strategic_objective || access.mission.strategic_objective || 'IDENTIFIER_BESOIN',
         expected_result || null,
         target_decision_maker || null,
         target_technical_prescriber || null,

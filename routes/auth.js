@@ -254,8 +254,8 @@ router.post('/login', async (req, res) => {
         clientType: isMobileClient ? 'mobile_pwa' : 'web_portal'
       });
 
-      // Ecrase/ecrit l'OTP dans un fichier temporaire en dev pour la validation automatisée
-      if (process.env.NODE_ENV !== 'production') {
+      // Disponible uniquement pour les tests locaux explicites.
+      if (process.env.NODE_ENV !== 'production' && process.env.LOG_DEV_OTP === 'true') {
         const fs = require('fs');
         const path = require('path');
         fs.writeFileSync(path.join(__dirname, '../last_otp.txt'), String(otp));

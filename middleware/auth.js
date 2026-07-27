@@ -2,7 +2,26 @@ const jwt = require('jsonwebtoken');
 const pool = require('../db');
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const TEMP_SIMPLE_AUTH = process.env.TEMP_SIMPLE_AUTH === 'true';
+const TEMP_SIMPLE_AUTH = process.env.TEMP_SIMPLE_AUTH === 'true' && process.env.NODE_ENV !== 'production';
+
+function isLoopbackAddress(value = '') {
+  const address = String(value).trim().toLowerCase();
+  return address === '127.0.0.1' ||
+    address === '::1' ||
+    address === 'localhost' ||
+    address === '::ffff:127.0.0.1' ||
+    address.startsWith('127.');
+}
+
+function canUseTemporaryAuth(req) {
+  if (!TEMP_SIMPLE_AUTH) return false;
+  const forwardedFor = String(req.headers['x-forwarded-for'] || '')
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean);
+  const candidates = [req.ip, req.socket?.remoteAddress, ...forwardedFor];
+  return candidates.some(isLoopbackAddress);
+}
 
 async function authenticateTemporarily(req, res, next) {
   const requestedUserId = Number(req.headers['x-crm-user-id'] || 0);
@@ -43,7 +62,7 @@ async function authenticate(req, res, next) {
   const token = req.cookies?.crm_access || bearerToken;
 
   if (!token) {
-    if (TEMP_SIMPLE_AUTH) return authenticateTemporarily(req, res, next);
+    if (canUseTemporaryAuth(req)) return authenticateTemporarily(req, res, next);
     return res.status(401).json({ error: 'Token d\'authentification manquant.' });
   }
 
@@ -103,7 +122,7 @@ async function authenticate(req, res, next) {
 
     next();
   } catch (err) {
-    if (TEMP_SIMPLE_AUTH) return authenticateTemporarily(req, res, next);
+    if (canUseTemporaryAuth(req)) return authenticateTemporarily(req, res, next);
     return res.status(401).json({ error: 'Token invalide ou expire.' });
   }
 }
