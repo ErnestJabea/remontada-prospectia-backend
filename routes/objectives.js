@@ -489,24 +489,34 @@ router.post('/', authenticate, authorize('DIRECTION', 'SYSTEM', 'ADMIN'), async 
     direction, department, service, observations, moyens, formations, team_member_ids
   } = req.body;
 
-  // Validation
-  if (!title || !period_type || !start_date || !end_date || !domain_id || !kpi_id) {
-    return res.status(400).json({ error: 'Champs obligatoires manquants.' });
+  const allowedPeriods = ['ANNUAL', 'SEMESTER', 'SEMESTRIAL', 'TRIMESTER', 'TRIMESTRIAL', 'MONTHLY', 'WEEKLY', 'DAILY', 'EXCEPTIONAL', 'PUNCTUAL'];
+
+  if (!title || typeof title !== 'string' || !title.trim()) {
+    return res.status(400).json({ error: "Le titre de l'objectif est obligatoire." });
   }
-  const allowedPeriods = ['ANNUAL', 'SEMESTRIAL', 'TRIMESTRIAL', 'MONTHLY', 'EXCEPTIONAL'];
-  if (
-    typeof title !== 'string' ||
-    !title.trim() ||
-    title.length > 150 ||
-    !allowedPeriods.includes(period_type) ||
-    Number.isNaN(Date.parse(start_date)) ||
-    Number.isNaN(Date.parse(end_date)) ||
-    new Date(start_date) > new Date(end_date) ||
-    !Number(domain_id) ||
-    !Number(kpi_id) ||
-    (target_value !== undefined && target_value !== null && target_value !== '' && Number(target_value) < 0)
-  ) {
-    return res.status(400).json({ error: 'Donnees d\'objectif invalides.' });
+  if (title.length > 1000) {
+    return res.status(400).json({ error: "Le titre est trop long (maximum 1000 caractères)." });
+  }
+  if (!period_type || !allowedPeriods.includes(period_type)) {
+    return res.status(400).json({ error: `Type de périodicité invalide : ${period_type}` });
+  }
+  if (!start_date || Number.isNaN(Date.parse(start_date))) {
+    return res.status(400).json({ error: "Date de début invalide." });
+  }
+  if (!end_date || Number.isNaN(Date.parse(end_date))) {
+    return res.status(400).json({ error: "Date de fin invalide." });
+  }
+  if (new Date(start_date) > new Date(end_date)) {
+    return res.status(400).json({ error: "La date de début ne peut pas être supérieure à la date de fin." });
+  }
+  if (!domain_id || !Number(domain_id)) {
+    return res.status(400).json({ error: "Le domaine clé de résultat est obligatoire." });
+  }
+  if (!kpi_id || !Number(kpi_id)) {
+    return res.status(400).json({ error: "L'indicateur KPI est obligatoire." });
+  }
+  if (target_value !== undefined && target_value !== null && target_value !== '' && Number(target_value) < 0) {
+    return res.status(400).json({ error: "La valeur cible doit être un nombre positif." });
   }
 
   // Cohérence des seuils
@@ -529,7 +539,7 @@ router.post('/', authenticate, authorize('DIRECTION', 'SYSTEM', 'ADMIN'), async 
         direction, department, service, observations, status, created_by
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?)`,
       [
-        code || null, title, description || null, parent_id || null, period_type, start_date, end_date, responsible_id || null,
+        code || null, title.trim(), description || null, parent_id || null, period_type, start_date, end_date, responsible_id || null,
         domain_id, kpi_id, target_value || null, unit || 'FCFA', min_level || null, expected_level || null, excellent_level || null,
         direction || null, department || null, service || null, observations || null, req.user.id
       ]
@@ -540,30 +550,32 @@ router.post('/', authenticate, authorize('DIRECTION', 'SYSTEM', 'ADMIN'), async 
     // Enregistrer les moyens
     if (moyens && Array.isArray(moyens)) {
       for (const m of moyens) {
-        await conn.query(
-          `INSERT INTO objectif_moyens (objective_id, type, description, quantity, estimated_cost, approval_status)
-           VALUES (?, ?, ?, ?, ?, 'PENDING')`,
-          [objId, m.type, m.description, m.quantity || 1, m.estimated_cost || 0]
-        );
+        if (m && m.description && m.description.trim()) {
+          await conn.query(
+            `INSERT INTO objectif_moyens (objective_id, type, description, quantity, estimated_cost, approval_status)
+             VALUES (?, ?, ?, ?, ?, 'PENDING')`,
+            [objId, m.type || 'BUDGET', m.description.trim(), m.quantity || 1, m.estimated_cost || 0]
+          );
+        }
       }
     }
 
     // Enregistrer les formations
     if (formations && Array.isArray(formations)) {
       for (const f of formations) {
-        await conn.query(
-          `INSERT INTO objectif_formations (objective_id, theme, goal, period, priority, status)
-           VALUES (?, ?, ?, ?, ?, 'PENDING')`,
-          [objId, f.theme, f.goal, f.period, f.priority || 'MEDIUM']
-        );
+        if (f && f.theme && f.theme.trim()) {
+          await conn.query(
+            `INSERT INTO objectif_formations (objective_id, theme, goal, period, priority, status)
+             VALUES (?, ?, ?, ?, ?, 'PENDING')`,
+            [objId, f.theme.trim(), f.goal || '—', f.period || '—', f.priority || 'MEDIUM']
+          );
+        }
       }
     }
 
     await syncObjectiveTeamMembers(conn, objId, team_member_ids);
 
     await conn.commit();
-
-    await logObjectiveHistory(objId, req.user.id, 'CREATE', null, { title, target_value }, 'Création initiale', req);
 
     res.status(201).json({ id: objId, message: 'Objectif créé sous forme de brouillon.' });
   } catch (err) {
@@ -583,19 +595,31 @@ router.put('/:id', authenticate, async (req, res) => {
     direction, department, service, observations, moyens, formations, team_member_ids
   } = req.body;
 
-  const allowedPeriods = ['ANNUAL', 'SEMESTRIAL', 'TRIMESTRIAL', 'MONTHLY', 'EXCEPTIONAL'];
-  if (
-    typeof title !== 'string' ||
-    !title.trim() ||
-    title.length > 150 ||
-    !allowedPeriods.includes(period_type) ||
-    Number.isNaN(Date.parse(start_date)) ||
-    Number.isNaN(Date.parse(end_date)) ||
-    new Date(start_date) > new Date(end_date) ||
-    !Number(domain_id) ||
-    !Number(kpi_id)
-  ) {
-    return res.status(400).json({ error: 'Donnees d\'objectif invalides.' });
+  const allowedPeriods = ['ANNUAL', 'SEMESTER', 'SEMESTRIAL', 'TRIMESTER', 'TRIMESTRIAL', 'MONTHLY', 'WEEKLY', 'DAILY', 'EXCEPTIONAL', 'PUNCTUAL'];
+
+  if (!title || typeof title !== 'string' || !title.trim()) {
+    return res.status(400).json({ error: "Le titre de l'objectif est obligatoire." });
+  }
+  if (title.length > 1000) {
+    return res.status(400).json({ error: "Le titre est trop long (maximum 1000 caractères)." });
+  }
+  if (!period_type || !allowedPeriods.includes(period_type)) {
+    return res.status(400).json({ error: `Type de périodicité invalide : ${period_type}` });
+  }
+  if (!start_date || Number.isNaN(Date.parse(start_date))) {
+    return res.status(400).json({ error: "Date de début invalide." });
+  }
+  if (!end_date || Number.isNaN(Date.parse(end_date))) {
+    return res.status(400).json({ error: "Date de fin invalide." });
+  }
+  if (new Date(start_date) > new Date(end_date)) {
+    return res.status(400).json({ error: "La date de début ne peut pas être supérieure à la date de fin." });
+  }
+  if (!domain_id || !Number(domain_id)) {
+    return res.status(400).json({ error: "Le domaine clé de résultat est obligatoire." });
+  }
+  if (!kpi_id || !Number(kpi_id)) {
+    return res.status(400).json({ error: "L'indicateur KPI est obligatoire." });
   }
 
   // Cohérence des seuils
@@ -632,32 +656,37 @@ router.put('/:id', authenticate, async (req, res) => {
         expected_level = ?, excellent_level = ?, direction = ?, department = ?, service = ?, observations = ?
        WHERE id = ?`,
       [
-        code || null, title, description || null, parent_id || null, period_type, start_date, end_date, responsible_id || null,
+        code || null, title.trim(), description || null, parent_id || null, period_type, start_date, end_date, responsible_id || null,
         domain_id, kpi_id, target_value || null, unit || 'FCFA', min_level || null, expected_level || null, excellent_level || null,
         direction || null, department || null, service || null, observations || null, req.params.id
       ]
     );
 
-    // Supprimer et réinsérer les moyens/formations pour garder le CRUD simple (si fournis)
-    if (moyens) {
+    // Mettre à jour les moyens
+    if (moyens && Array.isArray(moyens)) {
       await conn.query('DELETE FROM objectif_moyens WHERE objective_id = ?', [req.params.id]);
       for (const m of moyens) {
-        await conn.query(
-          `INSERT INTO objectif_moyens (objective_id, type, description, quantity, estimated_cost, validated_cost, approval_status)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [req.params.id, m.type, m.description, m.quantity || 1, m.estimated_cost || 0, m.validated_cost || 0, m.approval_status || 'PENDING']
-        );
+        if (m && m.description && m.description.trim()) {
+          await conn.query(
+            `INSERT INTO objectif_moyens (objective_id, type, description, quantity, estimated_cost, approval_status)
+             VALUES (?, ?, ?, ?, ?, 'PENDING')`,
+            [req.params.id, m.type || 'BUDGET', m.description.trim(), m.quantity || 1, m.estimated_cost || 0]
+          );
+        }
       }
     }
 
-    if (formations) {
+    // Mettre à jour les formations
+    if (formations && Array.isArray(formations)) {
       await conn.query('DELETE FROM objectif_formations WHERE objective_id = ?', [req.params.id]);
       for (const f of formations) {
-        await conn.query(
-          `INSERT INTO objectif_formations (objective_id, theme, goal, period, priority, status)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [req.params.id, f.theme, f.goal, f.period, f.priority || 'MEDIUM', f.status || 'PENDING']
-        );
+        if (f && f.theme && f.theme.trim()) {
+          await conn.query(
+            `INSERT INTO objectif_formations (objective_id, theme, goal, period, priority, status)
+             VALUES (?, ?, ?, ?, ?, 'PENDING')`,
+            [req.params.id, f.theme.trim(), f.goal || '—', f.period || '—', f.priority || 'MEDIUM']
+          );
+        }
       }
     }
 
