@@ -49,10 +49,12 @@ router.post('/push', authenticate, async (req, res) => {
 
           // Insert prospect
           const [resInsert] = await pool.query(
-            `INSERT INTO crm_institutions (name, type, tax_id, address, region_id, department_id, city_id, phone, email, website, created_by) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO crm_institutions (
+              name, type, tax_id, address, region_id, department_id, city_id,
+              phone, email, website, notes, is_active, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
-              payload.name,
+              payload.name ? payload.name.trim() : 'Prospect sans nom',
               payload.type || 'PROSPECT',
               payload.tax_id || null,
               payload.address || null,
@@ -62,6 +64,8 @@ router.post('/push', authenticate, async (req, res) => {
               payload.phone || null,
               payload.email || null,
               payload.website || null,
+              payload.notes || null,
+              true,
               req.user.id
             ]
           );
@@ -349,24 +353,34 @@ router.post('/push', authenticate, async (req, res) => {
       else if (type === 'opportunity') {
         if (action === 'create') {
           // Résoudre les identifiants locaux s'ils ont été créés lors de la même session offline
+          let resolvedInstId = payload.institution_id;
           if (localToServerIdMap.has(payload.institution_id)) {
-            payload.institution_id = localToServerIdMap.get(payload.institution_id);
+            resolvedInstId = localToServerIdMap.get(payload.institution_id);
           }
-          if (payload.mission_id && localToServerIdMap.has(payload.mission_id)) {
-            payload.mission_id = localToServerIdMap.get(payload.mission_id);
+          const instIdNum = Number(resolvedInstId);
+          if (!instIdNum || isNaN(instIdNum)) {
+            results.push({ localId, status: 'error', message: 'Institution invalide ou non trouvée pour cette opportunité.' });
+            errorCount++;
+            continue;
           }
+
+          let resolvedMissionId = payload.mission_id || null;
+          if (resolvedMissionId && localToServerIdMap.has(resolvedMissionId)) {
+            resolvedMissionId = localToServerIdMap.get(resolvedMissionId);
+          }
+
           // Check double validation
-          const doubleValidationRequired = parseFloat(payload.estimated_amount) > 50000000;
+          const doubleValidationRequired = parseFloat(payload.estimated_amount || 0) > 50000000;
           const initialStatus = doubleValidationRequired ? 'SUBMITTED' : 'DETECTED';
 
           const [resInsert] = await pool.query(
             'INSERT INTO crm_opportunities (institution_id, mission_id, title, need_description, estimated_amount, priority, status, pipeline_stage, assigned_to) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [
-              payload.institution_id,
-              payload.mission_id || null,
-              payload.title,
-              payload.need_description,
-              payload.estimated_amount,
+              instIdNum,
+              resolvedMissionId || null,
+              payload.title || 'Nouvelle opportunité',
+              payload.need_description || '',
+              parseFloat(payload.estimated_amount || 0),
               payload.priority || 'MEDIUM',
               initialStatus,
               payload.pipeline_stage || 'DETECTION',
