@@ -223,8 +223,9 @@ class OpportunityWorkflowService {
     if (!opp) throw new Error('Opportunité introuvable.');
     if (!this.canAccess(opp, user)) throw new Error('Accès refusé.');
 
-    // Transition valide depuis IN_ANALYSIS ou ACTION_PLAN (mise à jour)
-    if (opp.status !== 'IN_ANALYSIS' && opp.status !== 'ACTION_PLAN') {
+    // Transition valide depuis VALIDATED, IN_ANALYSIS ou ACTION_PLAN (mise à jour)
+    const allowedStatuses = ['VALIDATED', 'IN_ANALYSIS', 'ACTION_PLAN'];
+    if (!allowedStatuses.includes(opp.status)) {
       throw new Error(`Transition impossible : statut actuel '${opp.status}' ne permet pas de définir un plan d'action.`);
     }
 
@@ -511,24 +512,28 @@ class OpportunityWorkflowService {
       await connection.beginTransaction();
 
       // 1. Créer la mission
-      const [mResult] = await connection.query(
-        `INSERT INTO crm_missions (
-          objective_id, institution_id, title, description, scheduled_date,
-          duration_hours, primary_commercial_id, region_id, department_id, city_id, status
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT')`,
-        [
-          objective_id,
-          opp.institution_id,
-          title.trim(),
-          description || null,
-          scheduled_date,
-          duration_hours || 2,
-          primary_commercial_id,
-          region_id || opp.region_id || 1, // par défaut
-          department_id || opp.department_id || 1,
-          city_id || opp.city_id || 1
-        ]
-      );
+          const finalRegionId = (region_id && !isNaN(Number(region_id)) && Number(region_id) > 0) ? Number(region_id) : ((opp.region_id && Number(opp.region_id) > 0) ? Number(opp.region_id) : 1);
+          const finalDeptId = (department_id && !isNaN(Number(department_id)) && Number(department_id) > 0) ? Number(department_id) : ((opp.department_id && Number(opp.department_id) > 0) ? Number(opp.department_id) : 1);
+          const finalCityId = (city_id && !isNaN(Number(city_id)) && Number(city_id) > 0) ? Number(city_id) : ((opp.city_id && Number(opp.city_id) > 0) ? Number(opp.city_id) : 1);
+
+          const [mResult] = await connection.query(
+            `INSERT INTO crm_missions (
+              objective_id, institution_id, title, description, scheduled_date,
+              duration_hours, primary_commercial_id, region_id, department_id, city_id, status
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT')`,
+            [
+              objective_id,
+              opp.institution_id,
+              title.trim(),
+              description || null,
+              scheduled_date,
+              duration_hours || 2,
+              primary_commercial_id,
+              finalRegionId,
+              finalDeptId,
+              finalCityId
+            ]
+          );
 
       const missionId = mResult.insertId;
 
