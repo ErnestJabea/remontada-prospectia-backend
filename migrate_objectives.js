@@ -111,12 +111,13 @@ async function migrate() {
     }
   }
 
-  // Modifier la colonne status de crm_objectives
+  // Modifier la colonne status et title de crm_objectives
   await pool.query(`
     ALTER TABLE crm_objectives 
-    MODIFY COLUMN status ENUM('DRAFT', 'SUBMITTED', 'CORRECTION', 'REJECTED', 'VALIDATED', 'ASSIGNED', 'IN_PROGRESS', 'CLOSED', 'CANCELLED') DEFAULT 'DRAFT'
+    MODIFY COLUMN status ENUM('DRAFT', 'SUBMITTED', 'CORRECTION', 'REJECTED', 'VALIDATED', 'ASSIGNED', 'IN_PROGRESS', 'CLOSED', 'CANCELLED') DEFAULT 'DRAFT',
+    MODIFY COLUMN title TEXT NOT NULL
   `);
-  console.log('  ✅ ENUM de crm_objectives.status mis à jour');
+  console.log('  ✅ crm_objectives.status et title mis à jour en TEXT');
 
   // 6. Créer objectif_moyens
   await pool.query(`
