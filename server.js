@@ -60,35 +60,40 @@ app.use((req, res, next) => {
   next();
 });
 
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Trop de requetes. Reessayez dans 15 minutes.' }
-});
-const disableApiRateLimit = process.env.API_RATE_LIMIT_DISABLED === 'true' && process.env.NODE_ENV !== 'production';
+const disableApiRateLimit = process.env.API_RATE_LIMIT_DISABLED === 'true' || process.env.DISABLE_RATE_LIMIT === 'true';
 if (disableApiRateLimit) {
-  console.warn('[SECURITY] Rate limiting API desactive hors production via API_RATE_LIMIT_DISABLED=true.');
+  console.warn('[SECURITY] Rate limiting API desactive via API_RATE_LIMIT_DISABLED=true.');
 } else {
+  const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 200,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Trop de requetes. Reessayez dans 15 minutes.' }
+  });
+
+  const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Trop de tentatives de connexion.' }
+  });
+
+  const passwordResetLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Trop de demandes de reinitialisation. Reessayez plus tard.' }
+  });
+
   app.use('/api/', limiter);
+  app.use('/api/auth/login', loginLimiter);
+  app.use('/api/auth/verify-mfa', loginLimiter);
+  app.use('/api/auth/forgot-password', passwordResetLimiter);
+  app.use('/api/auth/reset-password', passwordResetLimiter);
 }
-
-const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Trop de tentatives de connexion.' }
-});
-
-const passwordResetLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Trop de demandes de reinitialisation. Reessayez plus tard.' }
-});
 
 const authRoutes = require('./routes/auth');
 const usersRoutes = require('./routes/users');
@@ -103,10 +108,6 @@ const notificationsRoutes = require('./routes/notifications');
 const securityRoutes = require('./routes/security');
 const permissionsRoutes = require('./routes/permissions');
 
-app.use('/api/auth/login', loginLimiter);
-app.use('/api/auth/verify-mfa', loginLimiter);
-app.use('/api/auth/forgot-password', passwordResetLimiter);
-app.use('/api/auth/reset-password', passwordResetLimiter);
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/referentials', referentialsRoutes);
