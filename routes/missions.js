@@ -97,6 +97,9 @@ const MISSION_EXTRA_COLUMNS = [
   ['gate1_validated_by', 'INT NULL'],
   ['order_verification_token', 'VARCHAR(96) DEFAULT NULL'],
   ['started_at', 'DATETIME NULL'],
+  ['check_in_at', 'DATETIME NULL'],
+  ['check_in_latitude', 'DECIMAL(10,7) NULL'],
+  ['check_in_longitude', 'DECIMAL(10,7) NULL'],
   ['completed_at', 'DATETIME NULL'],
   ['closed_at', 'DATETIME NULL']
 ];
