@@ -308,4 +308,4 @@ class ReportWorkflowService {
   }
 }
 
-module.exports = ReportWorkflowService;
+module.exports = require('../utils/transactionalWorkflow')(ReportWorkflowService, 'crm_reports', ["getReport","canAccess","logHistory"]);

@@ -45,7 +45,7 @@ async function migrate() {
       name VARCHAR(100) NOT NULL,
       description TEXT,
       domain_id INT NOT NULL,
-      type ENUM('QUANTITATIVE', 'FINANCIAL', 'PERCENTAGE', 'CALCULATED', 'MANUAL') NOT NULL,
+      type ENUM('QUANTITATIVE', 'QUALITATIVE', 'FINANCIAL', 'PERCENTAGE', 'CALCULATED', 'MANUAL') NOT NULL,
       unit VARCHAR(50) NOT NULL,
       calculation_source ENUM('MISSIONS', 'OPPORTUNITIES', 'REPORTS', 'ACTIVITIES', 'MANUAL') NOT NULL,
       calculation_rule TEXT, -- JSON configuration rule
@@ -56,6 +56,12 @@ async function migrate() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
   `);
   console.log('  ✅ Table kpis vérifiée');
+
+  await pool.query(`
+    ALTER TABLE kpis
+    MODIFY COLUMN type ENUM('QUANTITATIVE', 'QUALITATIVE', 'FINANCIAL', 'PERCENTAGE', 'CALCULATED', 'MANUAL') NOT NULL
+  `);
+  console.log('  ✅ Type KPI qualitatif disponible');
 
   // Helper function to check if a column exists
   async function columnExists(tableName, columnName) {
@@ -90,6 +96,11 @@ async function migrate() {
     { col: 'domain_id', sql: 'ADD COLUMN domain_id INT DEFAULT NULL, ADD CONSTRAINT fk_obj_domain FOREIGN KEY (domain_id) REFERENCES objectif_domaines(id) ON DELETE RESTRICT' },
     { col: 'kpi_id', sql: 'ADD COLUMN kpi_id INT DEFAULT NULL, ADD CONSTRAINT fk_obj_kpi FOREIGN KEY (kpi_id) REFERENCES kpis(id) ON DELETE RESTRICT' },
     { col: 'target_value', sql: 'ADD COLUMN target_value DECIMAL(15,2) DEFAULT NULL' },
+    { col: 'objective_nature', sql: "ADD COLUMN objective_nature ENUM('QUANTITATIVE', 'QUALITATIVE') NOT NULL DEFAULT 'QUANTITATIVE' AFTER kpi_id" },
+    { col: 'target_qlty', sql: 'ADD COLUMN target_qlty TEXT DEFAULT NULL' },
+    { col: 'qualitative_criteria', sql: 'ADD COLUMN qualitative_criteria JSON DEFAULT NULL' },
+    { col: 'qualitative_rating', sql: "ADD COLUMN qualitative_rating ENUM('NOT_ACHIEVED', 'UNDER_EXPECTATIONS', 'ACHIEVED', 'EXCEEDED') DEFAULT NULL" },
+    { col: 'qualitative_evidence', sql: 'ADD COLUMN qualitative_evidence TEXT DEFAULT NULL' },
     { col: 'unit', sql: 'ADD COLUMN unit VARCHAR(50) DEFAULT "FCFA"' },
     { col: 'min_level', sql: 'ADD COLUMN min_level DECIMAL(15,2) DEFAULT NULL' },
     { col: 'expected_level', sql: 'ADD COLUMN expected_level DECIMAL(15,2) DEFAULT NULL' },
@@ -173,10 +184,13 @@ async function migrate() {
       id INT AUTO_INCREMENT PRIMARY KEY,
       objective_id INT NOT NULL,
       date_calculated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      achieved_value DECIMAL(15,2) NOT NULL,
-      target_value DECIMAL(15,2) NOT NULL,
-      gap DECIMAL(15,2) NOT NULL,
+      result_type ENUM('QUANTITATIVE', 'QUALITATIVE') NOT NULL DEFAULT 'QUANTITATIVE',
+      achieved_value DECIMAL(15,2) DEFAULT NULL,
+      target_value DECIMAL(15,2) DEFAULT NULL,
+      gap DECIMAL(15,2) DEFAULT NULL,
       achievement_rate DECIMAL(5,2) NOT NULL,
+      qualitative_rating ENUM('NOT_ACHIEVED', 'UNDER_EXPECTATIONS', 'ACHIEVED', 'EXCEEDED') DEFAULT NULL,
+      qualitative_evidence TEXT DEFAULT NULL,
       notes TEXT DEFAULT NULL, -- Obligatoire pour manuel
       recorded_by INT DEFAULT NULL, -- Habilité si manuel
       FOREIGN KEY (objective_id) REFERENCES crm_objectives(id) ON DELETE CASCADE,
@@ -184,6 +198,24 @@ async function migrate() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
   `);
   console.log('  ✅ Table objectif_resultats vérifiée');
+
+  const resultAlters = [
+    { col: 'result_type', sql: "ADD COLUMN result_type ENUM('QUANTITATIVE', 'QUALITATIVE') NOT NULL DEFAULT 'QUANTITATIVE' AFTER date_calculated" },
+    { col: 'qualitative_rating', sql: "ADD COLUMN qualitative_rating ENUM('NOT_ACHIEVED', 'UNDER_EXPECTATIONS', 'ACHIEVED', 'EXCEEDED') DEFAULT NULL" },
+    { col: 'qualitative_evidence', sql: 'ADD COLUMN qualitative_evidence TEXT DEFAULT NULL' }
+  ];
+  for (const alt of resultAlters) {
+    if (!(await columnExists('objectif_resultats', alt.col))) {
+      await pool.query(`ALTER TABLE objectif_resultats ${alt.sql}`);
+      console.log(`  ✅ Colonne objectif_resultats.${alt.col} ajoutée`);
+    }
+  }
+  await pool.query(`
+    ALTER TABLE objectif_resultats
+    MODIFY COLUMN achieved_value DECIMAL(15,2) DEFAULT NULL,
+    MODIFY COLUMN target_value DECIMAL(15,2) DEFAULT NULL,
+    MODIFY COLUMN gap DECIMAL(15,2) DEFAULT NULL
+  `);
 
   // 10. Créer objectif_historiques
   await pool.query(`
@@ -226,6 +258,8 @@ async function migrate() {
   // Récupérer l'ID du domaine Commercial pour lier les KPIs
   const [comDomain] = await pool.query('SELECT id FROM objectif_domaines WHERE code = "COM"');
   const comDomainId = comDomain[0].id;
+  const [prospectingDomain] = await pool.query('SELECT id FROM objectif_domaines WHERE code = "PR"');
+  const prospectingDomainId = prospectingDomain[0]?.id || comDomainId;
 
   // 12. Seeder les KPIs par défaut s'ils n'existent pas
   const kpisSeed = [
@@ -288,6 +322,16 @@ async function migrate() {
         field: 'estimated_amount',
         filters: [{ column: 'status', operator: '=', value: 'WON' }]
       })
+    },
+    {
+      code: 'QUAL-PROSPECT',
+      name: 'Qualité de qualification du prospect',
+      desc: 'Appréciation documentée de la compréhension du besoin, du décideur et de la prochaine étape',
+      domain_id: prospectingDomainId,
+      type: 'QUALITATIVE',
+      unit: 'appréciation',
+      calculation_source: 'MANUAL',
+      calculation_rule: null
     }
   ];
 
@@ -316,6 +360,13 @@ async function migrate() {
       [comDomainId, defaultKpiId, defaultUnit]
     );
   }
+
+  await pool.query(`
+    UPDATE crm_objectives o
+    JOIN kpis k ON k.id = o.kpi_id
+    SET o.objective_nature = CASE WHEN k.type = 'QUALITATIVE' THEN 'QUALITATIVE' ELSE 'QUANTITATIVE' END
+  `);
+  console.log('  ✅ Nature des objectifs recalculée depuis leur KPI');
 
   console.log('\n✅ Migration et initialisation terminées avec succès !');
   process.exit(0);

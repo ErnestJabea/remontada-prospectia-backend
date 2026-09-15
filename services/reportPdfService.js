@@ -360,27 +360,27 @@ class ReportPdfService {
       ]);
     }
 
-    // Section: Déroulement & Synthèse
-    addPdfSection(doc, 'Déroulement & Synthèse');
+    // Section: Déroulement et Synthèse
+    addPdfSection(doc, 'Déroulement et Synthèse');
     drawContentBlock(doc, 'Résumé exécutif', report.executive_summary);
     drawContentBlock(doc, 'Résultats obtenus', report.results);
     drawContentBlock(doc, 'Personnes rencontrées / Administrations visitées', report.persons_met || report.administrations_visited);
 
-    // Section: Diagnostic & Constats
+    // Section: Diagnostic et Constats
     if (report.diagnosis) {
-      addPdfSection(doc, 'Diagnostic & Constats');
-      drawContentBlock(doc, 'Analyse documentaire & terrain', report.diagnosis);
+      addPdfSection(doc, 'Diagnostic et Constats');
+      drawContentBlock(doc, 'Analyse documentaire et terrain', report.diagnosis);
     }
 
     // Section: Difficultés
     if (report.difficulties) {
       addPdfSection(doc, 'Difficultés rencontrées');
-      drawContentBlock(doc, 'Obstacles & contraintes', report.difficulties);
+      drawContentBlock(doc, 'Obstacles et contraintes', report.difficulties);
     }
 
-    // Section: Recommandations & Prochaines étapes
+    // Section: Recommandations et Prochaines étapes
     if (report.recommendations || report.next_steps) {
-      addPdfSection(doc, 'Recommandations & Suites proposées');
+      addPdfSection(doc, 'Recommandations et Suites proposées');
       drawContentBlock(doc, 'Recommandations', report.recommendations);
       drawContentBlock(doc, 'Suites à donner / Actions de suivi', report.next_steps);
     }
@@ -408,7 +408,7 @@ class ReportPdfService {
 
     // Section: Validation (GATE 2)
     ensurePdfSpace(doc, 130);
-    addPdfSection(doc, 'Approbation & Suivi (GATE 2)');
+    addPdfSection(doc, 'Approbation et Suivi (GATE 2)');
     drawMetadataGrid(doc, [
       { label: 'Soumis par :', value: report.submitted_by_name },
       { label: 'Date soumission :', value: formatDateTime(report.submitted_at) },

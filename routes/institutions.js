@@ -39,7 +39,7 @@ async function ensureInstitutionStatusColumn() {
 }
 
 async function canEditInstitution(id, user) {
-  if (isManager(user)) return true;
+  if (isManager(user) && !user.restrictFeatureScope) return true;
   const [rows] = await pool.query(
     'SELECT created_by FROM crm_institutions WHERE id = ?',
     [id]
@@ -59,6 +59,7 @@ router.get('/', authenticate, async (req, res) => {
       JOIN crm_ref_cities c ON i.city_id = c.id`;
     const params = [];
     const conditions = [];
+    if (req.user.restrictFeatureScope) { conditions.push('i.created_by=?'); params.push(req.user.id); }
     if (type && TYPES.includes(type)) {
       conditions.push('i.type = ?');
       params.push(type);

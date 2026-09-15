@@ -107,23 +107,24 @@ async function sendPasswordResetEmail(to, username, otp) {
   }
 }
 
-async function sendInitialPasswordEmail(to, user) {
+async function sendInitialPasswordSetupEmail(to, user) {
   const emailBody = `
     <div style="font-family: Arial, sans-serif; max-width: 560px; margin: auto; padding: 28px;">
       <h2 style="color: #e31e24;">Bienvenue sur Remontada Prospectia</h2>
       <p>Bonjour <strong>${user.fullName || user.username}</strong>,</p>
-      <p>Votre compte commercial terrain a ete cree.</p>
+      <p>Votre compte a ete cree.</p>
       <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin: 18px 0;">
         <p style="margin: 0 0 8px;"><strong>Identifiant :</strong> ${user.username}</p>
-        <p style="margin: 0;"><strong>Mot de passe temporaire :</strong> ${user.password}</p>
+        <p style="margin: 0 0 8px;"><strong>Code de creation du mot de passe :</strong> ${user.otp}</p>
+        <p style="margin: 0;"><a href="${user.setupUrl}" style="color: #e31e24; font-weight: bold;">Definir mon mot de passe</a></p>
       </div>
-      <p>Connectez-vous au backoffice puis changez ce mot de passe des que possible.</p>
-      <p>Ne transferez pas cet email et ne communiquez jamais votre mot de passe.</p>
+      <p>Ce lien et ce code sont temporaires et ne peuvent etre utilises qu'une seule fois.</p>
+      <p>Ne transferez pas cet email et ne communiquez jamais ce code.</p>
     </div>
   `;
 
   if (!transporter) {
-    console.error('[MAIL] SMTP non configure. Mot de passe initial non envoye.');
+    console.error('[MAIL] SMTP non configure. Invitation de creation de mot de passe non envoyee.');
     return false;
   }
 
@@ -133,14 +134,14 @@ async function sendInitialPasswordEmail(to, user) {
       to,
       subject: 'Vos acces Remontada Prospectia',
       html: emailBody,
-      text: `Bonjour ${user.fullName || user.username}, votre compte commercial terrain a ete cree. Identifiant: ${user.username}. Mot de passe temporaire: ${user.password}. Changez ce mot de passe des que possible.`
+      text: `Bonjour ${user.fullName || user.username}, votre compte a ete cree. Identifiant: ${user.username}. Definissez votre mot de passe avec ce lien: ${user.setupUrl}. Code: ${user.otp}.`
     });
-    console.log(`[MAIL] Acces initiaux envoyes a ${to}.`);
+    console.log(`[MAIL] Invitation de creation de mot de passe envoyee a ${to}.`);
     return true;
   } catch (err) {
-    console.error(`[MAIL] Echec de l'envoi des acces initiaux a ${to}:`, err.message);
+    console.error(`[MAIL] Echec de l'envoi de l'invitation a ${to}:`, err.message);
     return false;
   }
 }
 
-module.exports = { sendOTPEmail, sendPasswordResetEmail, sendInitialPasswordEmail };
+module.exports = { sendOTPEmail, sendPasswordResetEmail, sendInitialPasswordSetupEmail };

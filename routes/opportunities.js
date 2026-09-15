@@ -1,3 +1,4 @@
+const canLinkRecord = require('../utils/linkedAccess');
 const express = require('express');
 const pool = require('../db');
 const { authenticate } = require('../middleware/auth');
@@ -6,6 +7,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const { deleteStoredUpload, sendStoredUpload, validateUploadedFilesContent } = require('../utils/uploadSecurity');
 
 const router = express.Router();
 
@@ -43,7 +45,7 @@ const upload = multer({
 
 function cleanupUploadedFiles(files = []) {
   for (const file of files) {
-    if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+    if (file.path) deleteStoredUpload(file.path);
   }
 }
 const MANAGER_ROLES = new Set(['DIRECTION', 'SYSTEM', 'ADMIN']);
@@ -94,7 +96,7 @@ router.get('/', authenticate, async (req, res) => {
     const conditions = [];
 
     // Restriction d'accès pour les commerciaux
-    if (req.user.role === 'COMMERCIAL') {
+    if (req.user.role === 'COMMERCIAL' || req.user.restrictFeatureScope) {
       conditions.push('op.assigned_to = ?');
       params.push(req.user.id);
     }
@@ -144,7 +146,7 @@ router.get('/pipeline', authenticate, async (req, res) => {
       WHERE op.status NOT IN ('ARCHIVED')`; // Exclure l'archivage du tableau Kanban général
       
     const params = [];
-    if (req.user.role === 'COMMERCIAL') {
+    if (req.user.role === 'COMMERCIAL' || req.user.restrictFeatureScope) {
       query += ' AND op.assigned_to = ?';
       params.push(req.user.id);
     }
@@ -278,6 +280,7 @@ router.post('/', authenticate, async (req, res) => {
   }
 
   try {
+    if (!await canLinkRecord(req.user,'missions',mission_id)) return res.status(403).json({error:'Mission inaccessible.'});
     const code = 'OP-' + Math.random().toString(36).substring(2, 7).toUpperCase();
 
     const [result] = await pool.query(
@@ -590,6 +593,10 @@ router.post('/:id/attachments', authenticate, upload.array('files', 5), async (r
       return res.status(403).json({ error: 'Accès refusé.' });
     }
     if (!req.files?.length) return res.status(400).json({ error: 'Aucun fichier fourni.' });
+    if (!validateUploadedFilesContent(req.files)) {
+      cleanupUploadedFiles(req.files);
+      return res.status(400).json({ error: 'Contenu de fichier non autorise.' });
+    }
 
     const inserts = req.files.map(file => [
       req.params.id,
@@ -625,10 +632,12 @@ router.get('/:id/attachments/:attId/download', authenticate, async (req, res) =>
        WHERE id = ? AND opportunity_id = ?`,
       [req.params.attId, req.params.id]
     );
-    if (!rows.length || !fs.existsSync(rows[0].file_path)) {
+    if (!rows.length) {
       return res.status(404).json({ error: 'Pièce jointe introuvable.' });
     }
-    return res.download(path.resolve(rows[0].file_path), rows[0].file_name);
+    if (!sendStoredUpload(res, rows[0].file_path, rows[0].file_name)) {
+      return res.status(404).json({ error: 'Pièce jointe introuvable.' });
+    }
   } catch (err) {
     console.error('[OPPORTUNITIES/DOWNLOAD]', err);
     return res.status(500).json({ error: 'Erreur serveur.' });
@@ -651,7 +660,7 @@ router.delete('/:id/attachments/:attId', authenticate, async (req, res) => {
       [req.params.attId, req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Pièce jointe introuvable.' });
-    if (fs.existsSync(rows[0].file_path)) fs.unlinkSync(rows[0].file_path);
+    deleteStoredUpload(rows[0].file_path);
     await pool.query(
       'DELETE FROM crm_opportunity_attachments WHERE id = ? AND opportunity_id = ?',
       [req.params.attId, req.params.id]

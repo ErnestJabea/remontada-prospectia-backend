@@ -3,11 +3,128 @@ const router = express.Router();
 const pool = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
 const { notifyDirection, notifyUser } = require('../utils/notifications');
+const {
+  createObjectiveProposal,
+  updateObjectiveProposal,
+  submitObjectiveProposal,
+  normalizeObjectiveTargets,
+  objectiveNatureFromKpiType,
+  assertActiveKpi
+} = require('../services/objectiveProposalService');
 
 const OBJECTIVE_MANAGER_ROLES = new Set(['DIRECTION', 'SYSTEM', 'ADMIN']);
+const ASSIGNABLE_OBJECTIVE_ROLES = new Set(['COMMERCIAL']);
+const ALLOWED_AFFECTATION_TYPES = new Set(['COMMERCIAL', 'TEAM', 'REGION', 'DEPARTMENT']);
+const ALLOWED_KPI_TYPES = new Set(['QUANTITATIVE', 'QUALITATIVE', 'FINANCIAL', 'PERCENTAGE', 'CALCULATED', 'MANUAL']);
+const ALLOWED_QUALITATIVE_RATINGS = new Set(['NOT_ACHIEVED', 'UNDER_EXPECTATIONS', 'ACHIEVED', 'EXCEEDED']);
+const QUALITATIVE_RATING_RATES = {
+  NOT_ACHIEVED: 0,
+  UNDER_EXPECTATIONS: 50,
+  ACHIEVED: 100,
+  EXCEEDED: 120
+};
 
 function isObjectiveManager(user) {
   return OBJECTIVE_MANAGER_ROLES.has(user.role);
+}
+
+function toPositiveId(value) {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+async function assertActiveCommercials(conn, ids, label) {
+  const uniqueIds = [...new Set(ids.map(toPositiveId).filter(Boolean))];
+  if (!uniqueIds.length) return [];
+
+  const placeholders = uniqueIds.map(() => '?').join(',');
+  const [rows] = await conn.query(
+    `SELECT id, full_name, role, is_active
+     FROM users
+     WHERE id IN (${placeholders})`,
+    uniqueIds
+  );
+  const usersById = new Map(rows.map(user => [Number(user.id), user]));
+
+  for (const id of uniqueIds) {
+    const user = usersById.get(id);
+    if (!user || !ASSIGNABLE_OBJECTIVE_ROLES.has(user.role) || !user.is_active) {
+      throw httpError(400, `${label} doit être un commercial actif.`);
+    }
+  }
+
+  return uniqueIds;
+}
+
+async function validateObjectiveParticipants(conn, {
+  responsibleId,
+  teamMemberIds = [],
+  creatorId,
+  allowCreatorAsResponsible = false
+}) {
+  const normalizedResponsibleId = responsibleId ? toPositiveId(responsibleId) : null;
+  if (responsibleId && !normalizedResponsibleId) {
+    throw httpError(400, 'Responsable principal invalide.');
+  }
+
+  if (!allowCreatorAsResponsible && normalizedResponsibleId && normalizedResponsibleId === Number(creatorId)) {
+    throw httpError(403, 'Le créateur ne peut pas se désigner comme responsable principal de son propre objectif.');
+  }
+
+  const normalizedTeamIds = [...new Set((Array.isArray(teamMemberIds) ? teamMemberIds : [])
+    .map(toPositiveId)
+    .filter(Boolean))];
+
+  if (normalizedTeamIds.includes(Number(creatorId))) {
+    throw httpError(403, "Le créateur ne peut pas s'ajouter dans l'équipe de son propre objectif.");
+  }
+  if (normalizedResponsibleId && normalizedTeamIds.includes(normalizedResponsibleId)) {
+    throw httpError(400, "Le responsable principal ne doit pas être répété dans la liste des commerciaux concernés.");
+  }
+
+  await assertActiveCommercials(
+    conn,
+    [normalizedResponsibleId, ...normalizedTeamIds].filter(Boolean),
+    "Le responsable principal et les commerciaux concernés"
+  );
+
+  return {
+    responsibleId: normalizedResponsibleId,
+    teamMemberIds: normalizedTeamIds
+  };
+}
+
+async function assertCompatibleObjectiveHierarchy(conn, parentIdValue, objectiveNature, objectiveId = null) {
+  const parentId = toPositiveId(parentIdValue);
+  if (parentIdValue && !parentId) throw httpError(400, 'Objectif parent invalide.');
+  if (parentId) {
+    if (objectiveId && Number(parentId) === Number(objectiveId)) {
+      throw httpError(400, 'Un objectif ne peut pas être son propre parent.');
+    }
+    const [parents] = await conn.query(
+      'SELECT objective_nature FROM crm_objectives WHERE id = ? LIMIT 1',
+      [parentId]
+    );
+    if (!parents.length) throw httpError(400, 'Objectif parent introuvable.');
+    if (parents[0].objective_nature !== objectiveNature) {
+      throw httpError(400, 'Un objectif et son parent doivent avoir la même nature de mesure.');
+    }
+  }
+  if (objectiveId) {
+    const [children] = await conn.query(
+      'SELECT COUNT(*) AS total FROM crm_objectives WHERE parent_id = ? AND objective_nature <> ?',
+      [objectiveId, objectiveNature]
+    );
+    if (Number(children[0]?.total || 0) > 0) {
+      throw httpError(400, 'La nature de cet objectif est incompatible avec celle de ses sous-objectifs.');
+    }
+  }
 }
 
 async function canAccessObjective(objective, user) {
@@ -25,8 +142,8 @@ async function canAccessObjective(objective, user) {
 
 async function syncObjectiveTeamMembers(conn, objectiveId, teamMemberIds = []) {
   const ids = [...new Set((Array.isArray(teamMemberIds) ? teamMemberIds : [])
-    .map(id => Number(id))
-    .filter(id => Number.isInteger(id) && id > 0))];
+    .map(toPositiveId)
+    .filter(Boolean))];
 
   await conn.query(
     'DELETE FROM objectif_affectations WHERE objective_id = ? AND type = "COMMERCIAL" AND value_allocated = 0',
@@ -63,6 +180,7 @@ async function logObjectiveHistory(objectiveId, userId, action, oldValue, newVal
     );
   } catch (err) {
     console.error('[AUDIT_ERROR] Failed to log history:', err);
+    if (pool.inTransaction()) throw err;
   }
 }
 
@@ -149,6 +267,14 @@ router.post('/kpis', authenticate, authorize('DIRECTION', 'ADMIN'), async (req, 
     return res.status(400).json({ error: 'Champs requis manquants pour le KPI.' });
   }
 
+  const normalizedType = String(type).toUpperCase();
+  if (!ALLOWED_KPI_TYPES.has(normalizedType)) {
+    return res.status(400).json({ error: 'Type de KPI non valide.' });
+  }
+  if (normalizedType === 'QUALITATIVE' && calculation_source !== 'MANUAL') {
+    return res.status(400).json({ error: 'Un KPI qualitatif doit être évalué manuellement.' });
+  }
+
   // Valider les sources et agrégations autorisées
   const allowedSources = ['MISSIONS', 'OPPORTUNITIES', 'REPORTS', 'ACTIVITIES', 'MANUAL'];
   if (!allowedSources.includes(calculation_source)) {
@@ -171,7 +297,7 @@ router.post('/kpis', authenticate, authorize('DIRECTION', 'ADMIN'), async (req, 
     const [result] = await pool.query(
       `INSERT INTO kpis (code, name, description, domain_id, type, unit, calculation_source, calculation_rule)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [code.toUpperCase(), name, description || null, domain_id, type, unit, calculation_source, calculation_rule || null]
+      [code.toUpperCase(), name, description || null, domain_id, normalizedType, unit, calculation_source, calculation_rule || null]
     );
     res.status(201).json({ id: result.insertId, message: 'KPI créé.' });
   } catch (err) {
@@ -183,11 +309,26 @@ router.post('/kpis', authenticate, authorize('DIRECTION', 'ADMIN'), async (req, 
 // PUT /api/objectives/kpis/:id
 router.put('/kpis/:id', authenticate, authorize('DIRECTION', 'ADMIN'), async (req, res) => {
   const { code, name, description, domain_id, type, unit, calculation_source, calculation_rule, active } = req.body;
+  const normalizedType = String(type || '').toUpperCase();
+  if (!ALLOWED_KPI_TYPES.has(normalizedType)) {
+    return res.status(400).json({ error: 'Type de KPI non valide.' });
+  }
+  if (normalizedType === 'QUALITATIVE' && calculation_source !== 'MANUAL') {
+    return res.status(400).json({ error: 'Un KPI qualitatif doit être évalué manuellement.' });
+  }
   try {
+    const [currentRows] = await pool.query('SELECT type FROM kpis WHERE id = ? LIMIT 1', [req.params.id]);
+    if (!currentRows.length) return res.status(404).json({ error: 'KPI introuvable.' });
+    if (currentRows[0].type !== normalizedType) {
+      const [usageRows] = await pool.query('SELECT COUNT(*) AS total FROM crm_objectives WHERE kpi_id = ?', [req.params.id]);
+      if (Number(usageRows[0]?.total || 0) > 0) {
+        return res.status(409).json({ error: "Le type d'un KPI déjà utilisé ne peut pas être modifié." });
+      }
+    }
     await pool.query(
       `UPDATE kpis SET code = ?, name = ?, description = ?, domain_id = ?, type = ?, unit = ?, 
        calculation_source = ?, calculation_rule = ?, active = ? WHERE id = ?`,
-      [code.toUpperCase(), name, description || null, domain_id, type, unit, calculation_source, calculation_rule || null, active !== false, req.params.id]
+      [code.toUpperCase(), name, description || null, domain_id, normalizedType, unit, calculation_source, calculation_rule || null, active !== false, req.params.id]
     );
     res.json({ message: 'KPI mis à jour.' });
   } catch (err) {
@@ -293,6 +434,9 @@ async function evaluateObjective(objectiveId, userId = 1) {
   const [objectives] = await pool.query('SELECT * FROM crm_objectives WHERE id = ?', [objectiveId]);
   if (!objectives.length) return;
   const obj = objectives[0];
+  if (obj.objective_nature === 'QUALITATIVE') {
+    throw httpError(400, "Un objectif qualitatif doit être évalué par une appréciation documentée.");
+  }
 
   // 1. Recalculate based on children or dynamic KPI
   const [children] = await pool.query('SELECT id, achieved_value FROM crm_objectives WHERE parent_id = ?', [objectiveId]);
@@ -377,7 +521,7 @@ router.get('/', authenticate, async (req, res) => {
     const { status, period_type, domain_id, responsible_id } = req.query;
     let query = `
       SELECT o.*, u.full_name as assignee_name, c.full_name as creator_name,
-             k.name as kpi_name, k.unit as kpi_unit, d.name as domain_name
+             k.name as kpi_name, k.type as kpi_type, k.unit as kpi_unit, d.name as domain_name
       FROM crm_objectives o
       LEFT JOIN users u ON o.responsible_id = u.id
       LEFT JOIN users c ON o.created_by = c.id
@@ -388,9 +532,9 @@ router.get('/', authenticate, async (req, res) => {
     const conditions = [];
 
     // Sécurité PWA : si commercial, filtrer par ses objectifs ou ceux assignés
-    if (req.user.role === 'COMMERCIAL') {
-      conditions.push('(o.responsible_id = ? OR o.id IN (SELECT objective_id FROM objectif_affectations WHERE target_id = ? AND type = "COMMERCIAL"))');
-      params.push(req.user.id, req.user.id);
+    if (req.user.role === 'COMMERCIAL' || req.user.restrictFeatureScope) {
+      conditions.push('(o.created_by = ? OR o.responsible_id = ? OR o.id IN (SELECT objective_id FROM objectif_affectations WHERE target_id = ? AND type = "COMMERCIAL"))');
+      params.push(req.user.id, req.user.id, req.user.id);
     } else if (responsible_id) {
       conditions.push('o.responsible_id = ?');
       params.push(responsible_id);
@@ -417,6 +561,9 @@ router.get('/', authenticate, async (req, res) => {
         return acc;
       }, {});
       rows.forEach(row => {
+        if (typeof row.qualitative_criteria === 'string') {
+          try { row.qualitative_criteria = JSON.parse(row.qualitative_criteria); } catch { row.qualitative_criteria = []; }
+        }
         row.affectations = affectationsByObjective[row.id] || [];
         row.team_member_ids = row.affectations
           .filter(aff => aff.type === 'COMMERCIAL' && Number(aff.value_allocated || 0) === 0 && aff.target_id)
@@ -474,10 +621,51 @@ router.get('/:id', authenticate, async (req, res) => {
     );
     objective.historiques = historiques;
 
+    const [resultats] = await pool.query(
+      'SELECT * FROM objectif_resultats WHERE objective_id = ? ORDER BY date_calculated DESC',
+      [objective.id]
+    );
+    objective.resultats = resultats;
+    if (typeof objective.qualitative_criteria === 'string') {
+      try { objective.qualitative_criteria = JSON.parse(objective.qualitative_criteria); } catch { objective.qualitative_criteria = []; }
+    }
+
     res.json(objective);
   } catch (err) {
     console.error('[OBJECTIVES]', err);
     res.status(500).json({ error: 'Erreur serveur.' });
+  }
+});
+
+// POST /api/objectives/proposals - proposition personnelle depuis la PWA terrain
+router.post('/proposals', authenticate, authorize('COMMERCIAL'), async (req, res) => {
+  try {
+    const result = await createObjectiveProposal(req.user, req.body, {
+      submitImmediately: Boolean(req.body?.submit_immediately)
+    });
+    return res.status(result.created ? 201 : 200).json({
+      objective: result.objective,
+      created: result.created,
+      message: result.created
+        ? (req.body?.submit_immediately ? 'Objectif créé et soumis à la direction.' : 'Objectif enregistré comme brouillon.')
+        : 'Cette proposition avait déjà été synchronisée.'
+    });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    console.error('[OBJECTIVES/PROPOSALS]', err);
+    return res.status(500).json({ error: 'Erreur serveur.' });
+  }
+});
+
+// PUT /api/objectives/:id/proposal - édition limitée au créateur terrain
+router.put('/:id/proposal', authenticate, authorize('COMMERCIAL'), async (req, res) => {
+  try {
+    const objective = await updateObjectiveProposal(req.user, req.params.id, req.body);
+    return res.json({ objective, message: 'Proposition mise à jour.' });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    console.error('[OBJECTIVES/PROPOSALS]', err);
+    return res.status(500).json({ error: 'Erreur serveur.' });
   }
 });
 
@@ -486,7 +674,7 @@ router.post('/', authenticate, authorize('DIRECTION', 'SYSTEM', 'ADMIN'), async 
   const {
     code, title, description, parent_id, period_type, start_date, end_date, responsible_id,
     domain_id, kpi_id, target_value, unit, min_level, expected_level, excellent_level,
-    direction, department, service, observations, moyens, formations, team_member_ids
+    target_qlty, qualitative_criteria, direction, department, service, observations, moyens, formations, team_member_ids
   } = req.body;
 
   const allowedPeriods = ['ANNUAL', 'SEMESTER', 'SEMESTRIAL', 'TRIMESTER', 'TRIMESTRIAL', 'MONTHLY', 'WEEKLY', 'DAILY', 'EXCEPTIONAL', 'PUNCTUAL'];
@@ -515,32 +703,34 @@ router.post('/', authenticate, authorize('DIRECTION', 'SYSTEM', 'ADMIN'), async 
   if (!kpi_id || !Number(kpi_id)) {
     return res.status(400).json({ error: "L'indicateur KPI est obligatoire." });
   }
-  if (target_value !== undefined && target_value !== null && target_value !== '' && Number(target_value) < 0) {
-    return res.status(400).json({ error: "La valeur cible doit être un nombre positif." });
-  }
-
-  // Cohérence des seuils
-  const minVal = parseFloat(min_level || 0);
-  const expVal = parseFloat(expected_level || 0);
-  const excVal = parseFloat(excellent_level || 0);
-
-  if (minVal > expVal || expVal > excVal) {
-    return res.status(400).json({ error: 'Règle de cohérence non respectée : Seuil Min <= Seuil Attendu <= Seuil Excellent.' });
-  }
-
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
+    const kpi = await assertActiveKpi(conn, { domain_id: Number(domain_id), kpi_id: Number(kpi_id) });
+    const targets = normalizeObjectiveTargets(
+      { target_value, min_level, expected_level, excellent_level, target_qlty, qualitative_criteria },
+      objectiveNatureFromKpiType(kpi.type)
+    );
+    await assertCompatibleObjectiveHierarchy(conn, parent_id, targets.objective_nature);
+
+    const participants = await validateObjectiveParticipants(conn, {
+      responsibleId: responsible_id,
+      teamMemberIds: team_member_ids,
+      creatorId: req.user.id
+    });
+
     const [result] = await conn.query(
       `INSERT INTO crm_objectives (
         code, title, description, parent_id, period_type, start_date, end_date, responsible_id,
-        domain_id, kpi_id, target_value, unit, min_level, expected_level, excellent_level,
+        domain_id, kpi_id, objective_nature, target_value, unit, min_level, expected_level, excellent_level,
+        target_qlty, qualitative_criteria,
         direction, department, service, observations, status, created_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?)`,
       [
-        code || null, title.trim(), description || null, parent_id || null, period_type, start_date, end_date, responsible_id || null,
-        domain_id, kpi_id, target_value || null, unit || 'FCFA', min_level || null, expected_level || null, excellent_level || null,
+        code || null, title.trim(), description || null, parent_id || null, period_type, start_date, end_date, participants.responsibleId,
+        domain_id, kpi_id, targets.objective_nature, targets.target_value, kpi.unit, targets.min_level, targets.expected_level, targets.excellent_level,
+        targets.target_qlty, JSON.stringify(targets.qualitative_criteria),
         direction || null, department || null, service || null, observations || null, req.user.id
       ]
     );
@@ -567,22 +757,26 @@ router.post('/', authenticate, authorize('DIRECTION', 'SYSTEM', 'ADMIN'), async 
           await conn.query(
             `INSERT INTO objectif_formations (objective_id, theme, goal, period, priority, status)
              VALUES (?, ?, ?, ?, ?, 'PENDING')`,
-            [objId, f.theme.trim(), f.goal || '—', f.period || '—', f.priority || 'MEDIUM']
+            [objId, f.theme.trim(), f.goal || '-', f.period || '-', f.priority || 'MEDIUM']
           );
         }
       }
     }
 
-    await syncObjectiveTeamMembers(conn, objId, team_member_ids);
+    await syncObjectiveTeamMembers(conn, objId, participants.teamMemberIds);
 
     await conn.commit();
 
     res.status(201).json({ id: objId, message: 'Objectif créé sous forme de brouillon.' });
   } catch (err) {
     await conn.rollback();
+    if (err.status) {
+      return res.status(err.status).json({ error: err.message });
+    }
     console.error('[OBJECTIVES]', err);
     res.status(500).json({ error: 'Erreur serveur.' });
   } finally {
+    await conn.rollback().catch(() => {});
     conn.release();
   }
 });
@@ -592,7 +786,7 @@ router.put('/:id', authenticate, async (req, res) => {
   const {
     code, title, description, parent_id, period_type, start_date, end_date, responsible_id,
     domain_id, kpi_id, target_value, unit, min_level, expected_level, excellent_level,
-    direction, department, service, observations, moyens, formations, team_member_ids
+    target_qlty, qualitative_criteria, direction, department, service, observations, moyens, formations, team_member_ids
   } = req.body;
 
   const allowedPeriods = ['ANNUAL', 'SEMESTER', 'SEMESTRIAL', 'TRIMESTER', 'TRIMESTRIAL', 'MONTHLY', 'WEEKLY', 'DAILY', 'EXCEPTIONAL', 'PUNCTUAL'];
@@ -622,17 +816,8 @@ router.put('/:id', authenticate, async (req, res) => {
     return res.status(400).json({ error: "L'indicateur KPI est obligatoire." });
   }
 
-  // Cohérence des seuils
-  const minVal = parseFloat(min_level || 0);
-  const expVal = parseFloat(expected_level || 0);
-  const excVal = parseFloat(excellent_level || 0);
-
-  if (minVal > expVal || expVal > excVal) {
-    return res.status(400).json({ error: 'Règle de cohérence non respectée : Seuil Min <= Seuil Attendu <= Seuil Excellent.' });
-  }
-
   // Récupérer l'ancien état pour audit et historique
-  const [oldRows] = await pool.query('SELECT * FROM crm_objectives WHERE id = ?', [req.params.id]);
+  const [oldRows] = await pool.query('SELECT * FROM crm_objectives WHERE id = ? FOR UPDATE', [req.params.id]);
   if (!oldRows.length) return res.status(404).json({ error: 'Objectif introuvable.' });
   const oldObj = oldRows[0];
 
@@ -649,15 +834,30 @@ router.put('/:id', authenticate, async (req, res) => {
   try {
     await conn.beginTransaction();
 
+    const kpi = await assertActiveKpi(conn, { domain_id: Number(domain_id), kpi_id: Number(kpi_id) });
+    const targets = normalizeObjectiveTargets(
+      { target_value, min_level, expected_level, excellent_level, target_qlty, qualitative_criteria },
+      objectiveNatureFromKpiType(kpi.type)
+    );
+    await assertCompatibleObjectiveHierarchy(conn, parent_id, targets.objective_nature, req.params.id);
+
+    const participants = await validateObjectiveParticipants(conn, {
+      responsibleId: responsible_id,
+      teamMemberIds: team_member_ids,
+      creatorId: oldObj.created_by,
+      allowCreatorAsResponsible: Number(oldObj.responsible_id) === Number(oldObj.created_by)
+    });
+
     await conn.query(
       `UPDATE crm_objectives SET 
         code = ?, title = ?, description = ?, parent_id = ?, period_type = ?, start_date = ?, end_date = ?, 
-        responsible_id = ?, domain_id = ?, kpi_id = ?, target_value = ?, unit = ?, min_level = ?, 
-        expected_level = ?, excellent_level = ?, direction = ?, department = ?, service = ?, observations = ?
+        responsible_id = ?, domain_id = ?, kpi_id = ?, objective_nature = ?, target_value = ?, unit = ?, min_level = ?,
+        expected_level = ?, excellent_level = ?, target_qlty = ?, qualitative_criteria = ?, direction = ?, department = ?, service = ?, observations = ?
        WHERE id = ?`,
       [
-        code || null, title.trim(), description || null, parent_id || null, period_type, start_date, end_date, responsible_id || null,
-        domain_id, kpi_id, target_value || null, unit || 'FCFA', min_level || null, expected_level || null, excellent_level || null,
+        code || null, title.trim(), description || null, parent_id || null, period_type, start_date, end_date, participants.responsibleId,
+        domain_id, kpi_id, targets.objective_nature, targets.target_value, kpi.unit, targets.min_level, targets.expected_level, targets.excellent_level,
+        targets.target_qlty, JSON.stringify(targets.qualitative_criteria),
         direction || null, department || null, service || null, observations || null, req.params.id
       ]
     );
@@ -684,14 +884,14 @@ router.put('/:id', authenticate, async (req, res) => {
           await conn.query(
             `INSERT INTO objectif_formations (objective_id, theme, goal, period, priority, status)
              VALUES (?, ?, ?, ?, ?, 'PENDING')`,
-            [req.params.id, f.theme.trim(), f.goal || '—', f.period || '—', f.priority || 'MEDIUM']
+            [req.params.id, f.theme.trim(), f.goal || '-', f.period || '-', f.priority || 'MEDIUM']
           );
         }
       }
     }
 
     if (Array.isArray(team_member_ids)) {
-      await syncObjectiveTeamMembers(conn, req.params.id, team_member_ids);
+      await syncObjectiveTeamMembers(conn, req.params.id, participants.teamMemberIds);
     }
 
     await conn.commit();
@@ -701,9 +901,13 @@ router.put('/:id', authenticate, async (req, res) => {
     res.json({ message: 'Objectif mis à jour avec succès.' });
   } catch (err) {
     await conn.rollback();
+    if (err.status) {
+      return res.status(err.status).json({ error: err.message });
+    }
     console.error('[OBJECTIVES]', err);
     res.status(500).json({ error: 'Erreur serveur.' });
   } finally {
+    await conn.rollback().catch(() => {});
     conn.release();
   }
 });
@@ -740,7 +944,14 @@ router.delete('/:id', authenticate, async (req, res) => {
 // POST /api/objectives/:id/submit
 router.post('/:id/submit', authenticate, async (req, res) => {
   try {
-    const [objs] = await pool.query('SELECT * FROM crm_objectives WHERE id = ?', [req.params.id]);
+    // Une proposition terrain est auto-affectée à son créateur et suit le
+    // workflow PWA dédié, sans écran d'affectation côté commercial.
+    if (req.user.role === 'COMMERCIAL') {
+      const objective = await submitObjectiveProposal(req.user, req.params.id);
+      return res.json({ message: 'Objectif soumis à la direction.', objective });
+    }
+
+    const [objs] = await pool.query('SELECT * FROM crm_objectives WHERE id = ? FOR UPDATE', [req.params.id]);
     if (!objs.length) return res.status(404).json({ error: 'Objectif introuvable.' });
     const obj = objs[0];
 
@@ -750,6 +961,14 @@ router.post('/:id/submit', authenticate, async (req, res) => {
 
     if (obj.status !== 'DRAFT' && obj.status !== 'CORRECTION') {
       return res.status(400).json({ error: 'L\'objectif n\'est pas dans un état soumisible.' });
+    }
+    const participants = await validateObjectiveParticipants(pool, {
+      responsibleId: obj.responsible_id,
+      teamMemberIds: [],
+      creatorId: obj.created_by
+    });
+    if (!participants.responsibleId) {
+      return res.status(400).json({ error: 'Le responsable principal est obligatoire avant soumission.' });
     }
 
     await pool.query('UPDATE crm_objectives SET status = "SUBMITTED" WHERE id = ?', [req.params.id]);
@@ -765,6 +984,9 @@ router.post('/:id/submit', authenticate, async (req, res) => {
 
     res.json({ message: 'Objectif soumis à la direction.' });
   } catch (err) {
+    if (err.status) {
+      return res.status(err.status).json({ error: err.message });
+    }
     console.error('[OBJECTIVES]', err);
     res.status(500).json({ error: 'Erreur serveur.' });
   }
@@ -781,25 +1003,52 @@ router.post('/:id/validate', authenticate, authorize('DIRECTION'), async (req, r
   try {
     await conn.beginTransaction();
 
-    const [objs] = await conn.query('SELECT * FROM crm_objectives WHERE id = ?', [req.params.id]);
+    const [objs] = await conn.query('SELECT * FROM crm_objectives WHERE id = ? FOR UPDATE', [req.params.id]);
     if (!objs.length) return res.status(404).json({ error: 'Objectif introuvable.' });
     const obj = objs[0];
 
     if (obj.status !== 'SUBMITTED') {
       return res.status(400).json({ error: 'Seuls les objectifs soumis peuvent être validés.' });
     }
-
     let targetStatus = 'VALIDATED';
     let labelAction = 'VALIDATE';
+    let assignedResponsibleId = obj.responsible_id || null;
     if (action === 'CORRECTION') {
       targetStatus = 'CORRECTION';
       labelAction = 'NEED_CORRECTION';
     } else if (action === 'REJECT') {
       targetStatus = 'REJECTED';
       labelAction = 'REJECT';
+    } else {
+      if (!assignedResponsibleId) {
+        const [creators] = await conn.query(
+          'SELECT id, role, is_active FROM users WHERE id = ? LIMIT 1',
+          [obj.created_by]
+        );
+        const creator = creators[0];
+        if (creator?.role === 'COMMERCIAL' && creator.is_active) {
+          assignedResponsibleId = creator.id;
+        }
+      }
+
+      if (!assignedResponsibleId) {
+        throw httpError(400, 'Le responsable principal est obligatoire avant validation.');
+      }
+
+      if (Number(assignedResponsibleId) !== Number(obj.created_by)) {
+        await validateObjectiveParticipants(conn, {
+          responsibleId: assignedResponsibleId,
+          teamMemberIds: [],
+          creatorId: obj.created_by
+        });
+      }
+      targetStatus = 'ASSIGNED';
     }
 
-    await conn.query('UPDATE crm_objectives SET status = ? WHERE id = ?', [targetStatus, req.params.id]);
+    await conn.query(
+      'UPDATE crm_objectives SET status = ?, responsible_id = ? WHERE id = ?',
+      [targetStatus, assignedResponsibleId, req.params.id]
+    );
 
     // Mettre à jour l'approbation des moyens si fournis
     if (moyens && Array.isArray(moyens)) {
@@ -831,16 +1080,20 @@ router.post('/:id/validate', authenticate, authorize('DIRECTION'), async (req, r
     const msg = `Votre objectif "${obj.title}" a été ${action === 'VALIDATE' ? 'validé' : (action === 'CORRECTION' ? 'renvoyé pour correction' : 'rejeté')} par la direction.`;
 
     if (obj.created_by) await notifyUser(obj.created_by, notifTitle, msg, notifType, obj.id);
-    if (obj.responsible_id && obj.responsible_id !== obj.created_by) {
-      await notifyUser(obj.responsible_id, notifTitle, msg, notifType, obj.id);
+    if (assignedResponsibleId && assignedResponsibleId !== obj.created_by) {
+      await notifyUser(assignedResponsibleId, notifTitle, msg, notifType, obj.id);
     }
 
     res.json({ message: `Objectif mis à jour avec le statut : ${targetStatus}` });
   } catch (err) {
     await conn.rollback();
+    if (err.status) {
+      return res.status(err.status).json({ error: err.message });
+    }
     console.error('[OBJECTIVES]', err);
     res.status(500).json({ error: 'Erreur serveur.' });
   } finally {
+    await conn.rollback().catch(() => {});
     conn.release();
   }
 });
@@ -856,7 +1109,7 @@ router.post('/:id/assign', authenticate, async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    const [objs] = await conn.query('SELECT * FROM crm_objectives WHERE id = ?', [req.params.id]);
+    const [objs] = await conn.query('SELECT * FROM crm_objectives WHERE id = ? FOR UPDATE', [req.params.id]);
     if (!objs.length) return res.status(404).json({ error: 'Objectif introuvable.' });
     const obj = objs[0];
 
@@ -868,11 +1121,59 @@ router.post('/:id/assign', authenticate, async (req, res) => {
       return res.status(409).json({ error: 'Seul un objectif valide peut etre affecte.' });
     }
 
+    const forbiddenCommercialIds = new Set(
+      [req.user.id, obj.created_by, obj.responsible_id]
+        .map(Number)
+        .filter(Boolean)
+    );
+    const commercialTargets = [];
+    const normalizedAffectations = affectations.map((aff) => {
+      const type = String(aff.type || '').toUpperCase();
+      if (!ALLOWED_AFFECTATION_TYPES.has(type)) {
+        throw httpError(400, "Type d'affectation invalide.");
+      }
+
+      const valueAllocated = Number(aff.value_allocated);
+      if (!Number.isFinite(valueAllocated) || valueAllocated < 0) {
+        throw httpError(400, 'La cible allouée doit être un nombre positif.');
+      }
+
+      if (type === 'COMMERCIAL') {
+        const targetId = toPositiveId(aff.target_id);
+        if (!targetId) {
+          throw httpError(400, 'Bénéficiaire commercial invalide.');
+        }
+        if (forbiddenCommercialIds.has(targetId)) {
+          throw httpError(403, "Le créateur, le responsable principal ou l'utilisateur connecté ne peut pas s'attribuer cet objectif.");
+        }
+        commercialTargets.push(targetId);
+        return {
+          type,
+          target_id: targetId,
+          target_name: aff.target_name || null,
+          value_allocated: valueAllocated
+        };
+      }
+
+      const targetName = String(aff.target_name || '').trim();
+      if (!targetName) {
+        throw httpError(400, "Le nom du bénéficiaire est obligatoire pour ce type d'affectation.");
+      }
+      return {
+        type,
+        target_id: null,
+        target_name: targetName,
+        value_allocated: valueAllocated
+      };
+    });
+
+    await assertActiveCommercials(conn, commercialTargets, 'Chaque bénéficiaire commercial');
+
     // Effacer les affectations existantes
     await conn.query('DELETE FROM objectif_affectations WHERE objective_id = ?', [req.params.id]);
 
     // Insérer les nouvelles affectations
-    for (const aff of affectations) {
+    for (const aff of normalizedAffectations) {
       await conn.query(
         `INSERT INTO objectif_affectations (objective_id, type, target_id, target_name, value_allocated)
          VALUES (?, ?, ?, ?, ?)`,
@@ -901,9 +1202,13 @@ router.post('/:id/assign', authenticate, async (req, res) => {
     res.json({ message: 'Affectations enregistrées avec succès. Objectif affecté.' });
   } catch (err) {
     await conn.rollback();
+    if (err.status) {
+      return res.status(err.status).json({ error: err.message });
+    }
     console.error('[OBJECTIVES]', err);
     res.status(500).json({ error: 'Erreur serveur.' });
   } finally {
+    await conn.rollback().catch(() => {});
     conn.release();
   }
 });
@@ -922,6 +1227,7 @@ router.post('/:id/evaluate', authenticate, async (req, res) => {
     await evaluateObjective(req.params.id, req.user.id);
     res.json({ message: 'Évaluation et consolidation accomplies avec succès.' });
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     console.error('[OBJECTIVES]', err);
     res.status(500).json({ error: 'Erreur serveur.' });
   }
@@ -929,14 +1235,14 @@ router.post('/:id/evaluate', authenticate, async (req, res) => {
 
 // POST /api/objectives/:id/record-manual-performance
 router.post('/:id/record-manual-performance', authenticate, authorize('DIRECTION'), async (req, res) => {
-  const { value, comments } = req.body;
-  if (value === undefined || value === null || !comments) {
-    return res.status(400).json({ error: 'Valeur et commentaire/justification obligatoires.' });
+  const { value, rating, comments } = req.body;
+  if (!comments || !String(comments).trim()) {
+    return res.status(400).json({ error: 'Le commentaire ou la justification est obligatoire.' });
   }
 
   try {
     const [objs] = await pool.query(
-      `SELECT o.*, k.calculation_source 
+      `SELECT o.*, k.calculation_source, k.type AS kpi_type
        FROM crm_objectives o 
        JOIN kpis k ON o.kpi_id = k.id 
        WHERE o.id = ?`,
@@ -948,6 +1254,41 @@ router.post('/:id/record-manual-performance', authenticate, authorize('DIRECTION
 
     if (obj.calculation_source !== 'MANUAL') {
       return res.status(400).json({ error: 'La saisie manuelle est réservée exclusivement aux KPIs de type MANUAL.' });
+    }
+
+    if (obj.objective_nature === 'QUALITATIVE') {
+      const normalizedRating = String(rating || '').toUpperCase();
+      if (!ALLOWED_QUALITATIVE_RATINGS.has(normalizedRating)) {
+        return res.status(400).json({ error: 'Appréciation qualitative invalide.' });
+      }
+      const mappedRate = QUALITATIVE_RATING_RATES[normalizedRating];
+      const oldRating = obj.qualitative_rating;
+      await pool.query(
+        `UPDATE crm_objectives
+         SET qualitative_rating = ?, qualitative_evidence = ?, achievement_rate = ?, performance_status = ?
+         WHERE id = ?`,
+        [normalizedRating, String(comments).trim(), mappedRate, normalizedRating, req.params.id]
+      );
+      await pool.query(
+        `INSERT INTO objectif_resultats
+           (objective_id, result_type, qualitative_rating, qualitative_evidence, achieved_value, target_value, gap, achievement_rate, notes, recorded_by)
+         VALUES (?, 'QUALITATIVE', ?, ?, NULL, NULL, NULL, ?, ?, ?)`,
+        [req.params.id, normalizedRating, String(comments).trim(), mappedRate, String(comments).trim(), req.user.id]
+      );
+      await logObjectiveHistory(
+        req.params.id,
+        req.user.id,
+        'RECORD_QUALITATIVE_PERFORMANCE',
+        { qualitative_rating: oldRating },
+        { qualitative_rating: normalizedRating },
+        String(comments).trim(),
+        req
+      );
+      return res.json({ message: 'Appréciation qualitative enregistrée.' });
+    }
+
+    if (value === undefined || value === null || value === '' || !Number.isFinite(Number(value))) {
+      return res.status(400).json({ error: 'La valeur réalisée doit être un nombre.' });
     }
 
     const oldValue = obj.achieved_value;
@@ -980,7 +1321,7 @@ router.post('/:id/record-manual-performance', authenticate, authorize('DIRECTION
 // POST /api/objectives/:id/close (Clôturer)
 router.post('/:id/close', authenticate, authorize('DIRECTION'), async (req, res) => {
   try {
-    const [objs] = await pool.query('SELECT * FROM crm_objectives WHERE id = ?', [req.params.id]);
+    const [objs] = await pool.query('SELECT * FROM crm_objectives WHERE id = ? FOR UPDATE', [req.params.id]);
     if (!objs.length) return res.status(404).json({ error: 'Objectif introuvable.' });
     const obj = objs[0];
 
@@ -1005,4 +1346,5 @@ router.post('/:id/close', authenticate, authorize('DIRECTION'), async (req, res)
   }
 });
 
+require('../utils/transactionalRoutes')(router, 'crm_objectives', ['/:id/submit','/:id/validate','/:id/assign','/:id/evaluate','/:id/record-manual-performance','/:id/close']);
 module.exports = router;

@@ -1,8 +1,10 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const pool = require('../db');
 const { authenticate, authorize } = require('../middleware/auth');
-const { sendInitialPasswordEmail } = require('../utils/mailer');
+const { sendInitialPasswordSetupEmail } = require('../utils/mailer');
+const { validateBaseCity } = require('../services/missionTravelService');
 
 const router = express.Router();
 const MANAGER_ROLES = new Set(['SYSTEM', 'DIRECTION', 'ADMIN']);
@@ -30,15 +32,42 @@ function normalizeEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) ? value : false;
 }
 
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function generateOTP() {
+  return crypto.randomInt(100000, 1000000).toString();
+}
+
+function generateInitialPassword() {
+  return `${crypto.randomBytes(24).toString('base64url')}Aa1!`;
+}
+
+function buildPasswordSetupUrl(ticket) {
+  const baseUrl = (
+    process.env.BACKOFFICE_PUBLIC_URL ||
+    process.env.FRONTEND_PUBLIC_URL ||
+    process.env.FRONTEND_URL ||
+    process.env.APP_URL ||
+    ''
+  ).replace(/\/+$/, '');
+  const query = `passwordSetupTicket=${encodeURIComponent(ticket)}`;
+  return baseUrl ? `${baseUrl}/?${query}` : `/?${query}`;
+}
+
 router.get('/', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (req, res) => {
+  if (req.user.restrictFeatureScope) return res.status(403).json({error:'La consultation des équipes exige le droit de vue globale.'});
   try {
     const [rows] = await pool.query(
       `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
-              u.email, u.phone, u.role, u.job_description_id, u.is_active,
+              u.email, u.phone, u.role, u.job_description_id, u.base_city_id,
+              base_city.name AS base_city_name, base_city.name_en AS base_city_name_en, u.is_active,
               u.is_verified, u.last_login, u.created_at, u.mfa_enabled,
               jd.title AS job_title, jd.role_category
        FROM users u
        LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
+       LEFT JOIN crm_ref_cities base_city ON u.base_city_id = base_city.id
        WHERE u.role NOT IN ('SYSTEM', 'ADMIN')
        ORDER BY u.created_at DESC`
     );
@@ -49,14 +78,17 @@ router.get('/', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (
   }
 });
 
-router.get('/commercials', authenticate, async (req, res) => {
+router.get('/commercials', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (req, res) => {
+  if (req.user.restrictFeatureScope) return res.status(403).json({error:'La consultation des équipes exige le droit de vue globale.'});
   try {
     const [rows] = await pool.query(
       `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
-              u.email, u.phone, u.role, u.is_active, u.last_login, u.mfa_enabled,
+               u.email, u.phone, u.role, u.is_active, u.last_login, u.mfa_enabled,
+               u.base_city_id, base_city.name AS base_city_name, base_city.name_en AS base_city_name_en,
               jd.title AS job_title
        FROM users u
        LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
+       LEFT JOIN crm_ref_cities base_city ON u.base_city_id = base_city.id
        WHERE u.role = 'COMMERCIAL' AND u.is_active = TRUE
        ORDER BY u.full_name`
     );
@@ -67,7 +99,7 @@ router.get('/commercials', authenticate, async (req, res) => {
   }
 });
 
-router.get('/job-descriptions/all', authenticate, async (req, res) => {
+router.get('/job-descriptions/all', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (req, res) => {
   try {
     const [rows] = await pool.query(
       'SELECT id, title, description, role_category FROM job_descriptions ORDER BY role_category, title'
@@ -90,10 +122,12 @@ router.get('/:id', authenticate, async (req, res) => {
     const [rows] = await pool.query(
       `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
               u.email, u.phone, u.role, u.is_active, u.is_verified,
-              u.last_login, u.created_at, u.avatar_url, u.mfa_enabled,
+               u.last_login, u.created_at, u.avatar_url, u.mfa_enabled,
+               u.base_city_id, base_city.name AS base_city_name, base_city.name_en AS base_city_name_en,
               jd.id AS job_description_id, jd.title AS job_title, jd.role_category
        FROM users u
        LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
+       LEFT JOIN crm_ref_cities base_city ON u.base_city_id = base_city.id
        WHERE u.id = ?`,
       [requestedId]
     );
@@ -125,7 +159,7 @@ router.get('/:id/devices', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN
 router.post('/', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (req, res) => {
   const {
     username, password, full_name, first_name, last_name,
-    email, phone, role, job_description_id
+    email, phone, role, job_description_id, base_city_id
   } = req.body;
   const normalizedEmail = normalizeEmail(email);
   if (
@@ -133,39 +167,59 @@ router.post('/', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async 
     typeof full_name !== 'string' || !full_name.trim() || full_name.length > 100 ||
     !validPassword(password) || !ASSIGNABLE_ROLES.has(role) ||
     normalizedEmail === false ||
-    (role === 'COMMERCIAL' && !normalizedEmail)
+    (role === 'COMMERCIAL' && (!normalizedEmail || !Number(base_city_id)))
   ) {
     return res.status(400).json({
-      error: 'Donnees utilisateur invalides. Pour un commercial, un email valide est obligatoire. Le mot de passe doit contenir au moins 10 caracteres, avec majuscule, minuscule, chiffre et symbole.'
+      error: 'Donnees utilisateur invalides. Pour un commercial, un email valide et une ville de rattachement sont obligatoires. Le mot de passe doit contenir au moins 10 caracteres, avec majuscule, minuscule, chiffre et symbole.'
     });
   }
 
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    const hashedPassword = await bcrypt.hash(password, 12);
+    const baseCity = await validateBaseCity(connection, base_city_id, role === 'COMMERCIAL');
+    const shouldSendSetupLink = role === 'COMMERCIAL';
+    const initialPassword = shouldSendSetupLink ? generateInitialPassword() : password;
+    const hashedPassword = await bcrypt.hash(initialPassword, 12);
     const [result] = await connection.query(
       `INSERT INTO users (
         username, password, full_name, first_name, last_name,
-        email, phone, role, job_description_id, is_verified
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)`,
+        email, phone, role, job_description_id, base_city_id, is_verified
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)`,
       [
         username.trim(), hashedPassword, full_name.trim(), first_name || null,
         last_name || null, normalizedEmail, phone || null, role,
-        Number(job_description_id) || null
+        Number(job_description_id) || null, baseCity?.id || null
       ]
     );
 
-    if (role === 'COMMERCIAL') {
-      const emailSent = await sendInitialPasswordEmail(normalizedEmail, {
+    if (shouldSendSetupLink) {
+      const ticket = crypto.randomUUID();
+      const otp = generateOTP();
+      const otpHash = await bcrypt.hash(otp, 12);
+      await connection.query(
+        `UPDATE password_reset_tokens
+         SET used_at = NOW()
+         WHERE user_id = ? AND used_at IS NULL`,
+        [result.insertId]
+      );
+      await connection.query(
+        `INSERT INTO password_reset_tokens (
+          user_id, ticket_hash, otp_hash, expires_at
+        ) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 24 HOUR))`,
+        [result.insertId, hashToken(ticket), otpHash]
+      );
+
+      const emailSent = await sendInitialPasswordSetupEmail(normalizedEmail, {
         username: username.trim(),
         fullName: full_name.trim(),
-        password
+        setupUrl: buildPasswordSetupUrl(ticket),
+        otp
       });
       if (!emailSent) {
         await connection.rollback();
         return res.status(503).json({
-          error: 'Utilisateur non cree : impossible d\'envoyer le mot de passe par email. Verifiez la configuration SMTP.'
+          error: 'Utilisateur non cree : impossible d\'envoyer l\'invitation de creation du mot de passe. Verifiez la configuration SMTP.'
         });
       }
     }
@@ -187,24 +241,26 @@ router.post('/', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async 
 router.put('/:id', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (req, res) => {
   const {
     full_name, first_name, last_name, email, phone,
-    role, job_description_id, is_active
+    role, job_description_id, base_city_id, is_active
   } = req.body;
   if (
     typeof full_name !== 'string' || !full_name.trim() ||
-    full_name.length > 100 || !ASSIGNABLE_ROLES.has(role)
+    full_name.length > 100 || !ASSIGNABLE_ROLES.has(role) ||
+    (role === 'COMMERCIAL' && !Number(base_city_id))
   ) {
     return res.status(400).json({ error: 'Donnees utilisateur invalides.' });
   }
 
   try {
+    const baseCity = await validateBaseCity(pool, base_city_id, role === 'COMMERCIAL');
     const [result] = await pool.query(
       `UPDATE users
        SET full_name = ?, first_name = ?, last_name = ?, email = ?, phone = ?,
-           role = ?, job_description_id = ?, is_active = ?, updated_at = NOW()
+           role = ?, job_description_id = ?, base_city_id = ?, is_active = ?, updated_at = NOW()
        WHERE id = ? AND role NOT IN ('SYSTEM', 'ADMIN')`,
       [
         full_name.trim(), first_name || null, last_name || null, email || null,
-        phone || null, role, Number(job_description_id) || null,
+        phone || null, role, Number(job_description_id) || null, baseCity?.id || null,
         is_active !== false, req.params.id
       ]
     );
@@ -228,7 +284,7 @@ router.put('/:id/password', authenticate, authorize('SYSTEM', 'ADMIN'), async (r
   }
   try {
     const hashed = await bcrypt.hash(newPassword, 12);
-    await pool.query('UPDATE users SET password = ? WHERE id = ?', [hashed, req.params.id]);
+    await pool.query('UPDATE users SET password = ?, auth_version = auth_version + 1 WHERE id = ?', [hashed, req.params.id]);
     await pool.query('DELETE FROM refresh_tokens WHERE user_id = ?', [req.params.id]);
     return res.json({ message: 'Mot de passe mis a jour.' });
   } catch (err) {

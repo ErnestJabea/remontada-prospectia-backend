@@ -11,7 +11,7 @@ async function notifyDirection(title, message, type, targetId = null) {
   try {
     // 1. Récupérer les utilisateurs Direction
     const [users] = await pool.query(
-      "SELECT id FROM users WHERE role IN ('DIRECTION', 'ADMIN')"
+      "SELECT id FROM users WHERE role IN ('DIRECTION', 'ADMIN') AND is_active = TRUE"
     );
 
     if (users.length === 0) return;
@@ -28,6 +28,7 @@ async function notifyDirection(title, message, type, targetId = null) {
     await Promise.all(insertPromises);
     console.log(`[NOTIF] Notification de type ${type} envoyée à ${users.length} utilisateurs de la direction.`);
   } catch (err) {
+    if (pool.inTransaction()) throw err;
     console.error('[NOTIF_ERROR]', err);
   }
 }
@@ -49,6 +50,7 @@ async function notifyUser(userId, title, message, type, targetId = null) {
     );
     console.log(`[NOTIF] Notification de type ${type} envoyée à l'utilisateur ${userId}.`);
   } catch (err) {
+    if (pool.inTransaction()) throw err;
     console.error('[NOTIF_USER_ERROR]', err);
   }
 }

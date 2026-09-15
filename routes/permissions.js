@@ -39,7 +39,7 @@ const MODULE_CATALOGUE = [
     module_id: 'admin',
     module_label: 'Administration',
     feature_id: 'users',
-    feature_label: 'Utilisateurs & Équipes'
+    feature_label: 'Utilisateurs et Équipes'
   },
   {
     module_id: 'admin',
@@ -51,13 +51,13 @@ const MODULE_CATALOGUE = [
     module_id: 'admin',
     module_label: 'Administration',
     feature_id: 'kpis',
-    feature_label: 'KPI & Indicateurs'
+    feature_label: 'KPI et Indicateurs'
   },
   {
     module_id: 'admin',
     module_label: 'Administration',
     feature_id: 'security',
-    feature_label: 'Sécurité & Audit'
+    feature_label: 'Sécurité et Audit'
   }
 ];
 
@@ -188,7 +188,7 @@ router.put('/job-descriptions/:jobId/feature', authenticate, authorize('SYSTEM',
        VALUES (?, ?, 'permissions', ?)`,
       [
         req.user.id,
-        `MAJ habilitations job#${jobId} — ${module_id}/${feature_id}`.slice(0, 100),
+        `MAJ habilitations job#${jobId} - ${module_id}/${feature_id}`.slice(0, 100),
         (req.ip || req.socket?.remoteAddress || 'unknown').slice(0, 45)
       ]
     ).catch(e => console.error('[AUDIT_PERMS]', e.message));

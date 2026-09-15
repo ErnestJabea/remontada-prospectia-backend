@@ -15,9 +15,20 @@ const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 const JWT_REFRESH_EXPIRES = process.env.JWT_REFRESH_EXPIRES_IN || '7d';
 const ACCESS_COOKIE = 'crm_access';
 const REFRESH_COOKIE = 'crm_refresh';
+const JWT_ALGORITHMS = ['HS256'];
+const MFA_TTL_MS = 10 * 60 * 1000;
+const MFA_RESEND_COOLDOWN_MS = 30 * 1000;
+const MFA_MAX_RESENDS = 3;
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync('Invalid-password-timing-padding-9!', 12);
 
 const secureCookies = process.env.NODE_ENV === 'production' || process.env.COOKIE_SECURE === 'true';
-const cookieSameSite = process.env.COOKIE_SAMESITE || (secureCookies ? 'none' : 'lax');
+const configuredSameSite = String(process.env.COOKIE_SAMESITE || '').toLowerCase();
+const cookieSameSite = ['strict', 'lax', 'none'].includes(configuredSameSite)
+  ? configuredSameSite
+  : (secureCookies ? 'none' : 'lax');
+if (cookieSameSite === 'none' && !secureCookies) {
+  throw new Error('COOKIE_SAMESITE=none exige des cookies Secure.');
+}
 const baseCookieOptions = {
   httpOnly: true,
   secure: secureCookies,
@@ -31,6 +42,30 @@ function generateOTP() {
 
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function hashOtp(otp) {
+  return crypto.createHmac('sha256', JWT_SECRET).update(String(otp)).digest('hex');
+}
+
+function secureHashEquals(expectedHash, candidate) {
+  if (typeof expectedHash !== 'string' || typeof candidate !== 'string') return false;
+  const expected = Buffer.from(expectedHash, 'hex');
+  const actual = Buffer.from(hashOtp(candidate), 'hex');
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function cleanupExpiredMfaTickets() {
+  const now = Date.now();
+  for (const [ticket, data] of mfaTickets.entries()) {
+    if (!data || data.expiry <= now) mfaTickets.delete(ticket);
+  }
+}
+
+function normalizeDeviceValue(value, maxLength, fallback) {
+  if (typeof value !== 'string') return fallback;
+  const normalized = value.trim();
+  return normalized ? normalized.slice(0, maxLength) : fallback;
 }
 
 function validPassword(password) {
@@ -48,7 +83,10 @@ function tokenMaxAge(token) {
   return decoded?.exp ? Math.max((decoded.exp * 1000) - Date.now(), 0) : undefined;
 }
 
-function publicUser(user) {
+async function publicUser(user) {
+  const [jobPermissions] = user.job_description_id && user.role !== 'SYSTEM'
+    ? await pool.query('SELECT module_id, feature_id, can_view, can_view_all, can_create, can_update, can_delete, can_reorganize FROM job_feature_permissions WHERE job_description_id=?',[user.job_description_id])
+    : [[]];
   let settings = null;
   if (user.settings) {
     if (typeof user.settings === 'object') {
@@ -67,6 +105,9 @@ function publicUser(user) {
     email: user.email,
     role: user.role,
     job_title: user.job_title,
+    job_description_id: user.job_description_id || null,
+    jobPermissions,
+    base_city_id: user.base_city_id || null,
     avatar_url: user.avatar_url,
     settings: settings,
     mfa_enabled: Boolean(user.mfa_enabled)
@@ -81,18 +122,20 @@ function createAccessToken(user, clientType) {
       username: user.username,
       role: user.role,
       full_name: user.full_name,
-      clientType
+      clientType,
+      authVersion: Number(user.auth_version || 0),
+      jti: crypto.randomUUID()
     },
     JWT_SECRET,
-    { expiresIn: JWT_EXPIRES_IN }
+    { algorithm: 'HS256', expiresIn: JWT_EXPIRES_IN }
   );
 }
 
-function createRefreshToken(userId) {
+function createRefreshToken(userId, authVersion = 0) {
   return jwt.sign(
-    { id: userId, jti: crypto.randomUUID() },
+    { id: userId, authVersion: Number(authVersion), jti: crypto.randomUUID() },
     JWT_REFRESH_SECRET,
-    { expiresIn: JWT_REFRESH_EXPIRES }
+    { algorithm: 'HS256', expiresIn: JWT_REFRESH_EXPIRES }
   );
 }
 
@@ -127,7 +170,15 @@ async function logLoginAttempt(userId, username, ip, ua, clientType, status, fai
     await pool.query(
       `INSERT INTO crm_login_history (user_id, username, ip_address, user_agent, client_type, status, failure_reason)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [userId, username, ip, ua, clientType || 'unknown', status, failureReason]
+      [
+        userId,
+        String(username || 'unknown').slice(0, 50),
+        String(ip || 'unknown').slice(0, 45),
+        ua ? String(ua).slice(0, 255) : null,
+        String(clientType || 'unknown').slice(0, 20),
+        status,
+        failureReason ? String(failureReason).slice(0, 100) : null
+      ]
     );
   } catch (err) {
     console.error('[LOG_LOGIN_ERROR]', err.message);
@@ -136,7 +187,9 @@ async function logLoginAttempt(userId, username, ip, ua, clientType, status, fai
 
 router.post('/login', async (req, res) => {
   const { username, password, clientType, deviceId, deviceName } = req.body;
-  const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const normalizedClientType = clientType === 'mobile_pwa' ? 'mobile_pwa' : 'web_portal';
+  const isMobileClient = normalizedClientType === 'mobile_pwa';
+  const ip = req.ip || req.socket.remoteAddress;
   const ua = req.headers['user-agent'] || null;
 
   if (
@@ -161,6 +214,7 @@ router.post('/login', async (req, res) => {
       [username.trim()]
     );
     if (!rows.length) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
       await logLoginAttempt(null, username.trim(), ip, ua, clientType, 'FAILED', 'Identifiants incorrects');
       return res.status(401).json({ error: 'Identifiants incorrects.' });
     }
@@ -188,8 +242,6 @@ router.post('/login', async (req, res) => {
       return res.status(403).json({ error: 'Compte desactive. Contactez l\'administrateur.' });
     }
 
-    const isMobileClient = !clientType || clientType === 'mobile_pwa';
-
     await pool.query(
       `UPDATE users 
        SET failed_login_attempts = 0, 
@@ -198,60 +250,25 @@ router.post('/login', async (req, res) => {
            last_activity = NOW(), 
            last_active_client = ? 
        WHERE id = ?`,
-      [isMobileClient ? 'mobile_pwa' : 'web_portal', user.id]
+      [normalizedClientType, user.id]
     );
 
     const requiresMfa = Boolean(user.mfa_enabled) || isMobileClient;
 
     if (requiresMfa) {
-      // Si l'adresse IP n'a pas changé depuis le dernier MFA réussi, on bypass l'OTP
-      if (user.last_mfa_ip && user.last_mfa_ip === ip) {
-        const logClientType = isMobileClient ? 'mobile_pwa' : 'web_portal';
-        const accessToken = createAccessToken(user, logClientType);
-        const refreshToken = createRefreshToken(user.id);
-        const devId = deviceId || crypto.randomUUID();
-        const devName = deviceName || (isMobileClient ? 'Terrain' : 'Web Portal');
-
-        await storeRefreshToken(pool, user.id, refreshToken, devId);
-        await pool.query(
-          `INSERT INTO user_authorized_devices (user_id, device_id, device_name)
-           VALUES (?, ?, ?)
-           ON DUPLICATE KEY UPDATE device_name = VALUES(device_name), last_used_at = NOW()`,
-          [user.id, devId, devName]
-        );
-
-        await pool.query(
-          `UPDATE users 
-           SET last_activity = NOW(), 
-               last_active_client = ? 
-           WHERE id = ?`,
-          [logClientType, user.id]
-        );
-
-        await logLoginAttempt(user.id, user.username, ip, ua, logClientType, 'SUCCESS', 'Bypass MFA par IP');
-
-        if (logClientType === 'web_portal') {
-          setWebCookies(res, accessToken, refreshToken);
-        }
-
-        return res.json({
-          token: accessToken,
-          accessToken,
-          refreshToken,
-          user: publicUser(user)
-        });
-      }
-
+      cleanupExpiredMfaTickets();
       const ticket = crypto.randomUUID();
       const otp = generateOTP();
       mfaTickets.set(ticket, {
         userId: user.id,
-        otp,
-        expiry: Date.now() + 10 * 60 * 1000,
+        otpHash: hashOtp(otp),
+        expiry: Date.now() + MFA_TTL_MS,
         attempts: 0,
-        deviceId: deviceId || null,
-        deviceName: deviceName || (isMobileClient ? 'Terrain' : 'Web Portal'),
-        clientType: isMobileClient ? 'mobile_pwa' : 'web_portal'
+        resendCount: 0,
+        lastSentAt: Date.now(),
+        deviceId: normalizeDeviceValue(deviceId, 100, null),
+        deviceName: normalizeDeviceValue(deviceName, 100, isMobileClient ? 'Terrain' : 'Web Portal'),
+        clientType: normalizedClientType
       });
 
       // Disponible uniquement pour les tests locaux explicites.
@@ -275,17 +292,19 @@ router.post('/login', async (req, res) => {
 
 
     const accessToken = createAccessToken(user, 'web_portal');
-    const refreshToken = createRefreshToken(user.id);
-    await storeRefreshToken(pool, user.id, refreshToken, deviceId || `web-${crypto.randomUUID()}`);
+    const refreshToken = createRefreshToken(user.id, user.auth_version);
+    await storeRefreshToken(
+      pool,
+      user.id,
+      refreshToken,
+      normalizeDeviceValue(deviceId, 100, `web-${crypto.randomUUID()}`)
+    );
     setWebCookies(res, accessToken, refreshToken);
 
     await logLoginAttempt(user.id, username.trim(), ip, ua, 'web_portal', 'SUCCESS');
 
     return res.json({
-      user: publicUser(user),
-      token: accessToken,
-      accessToken,
-      refreshToken
+      user: await publicUser(user)
     });
   } catch (err) {
     console.error('[AUTH/LOGIN]', err);
@@ -295,10 +314,16 @@ router.post('/login', async (req, res) => {
 
 router.post('/verify-mfa', async (req, res) => {
   const { ticket, otp, deviceId, deviceName } = req.body;
-  const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const ip = req.ip || req.socket.remoteAddress;
   const ua = req.headers['user-agent'] || null;
 
-  if (!ticket || !otp) return res.status(400).json({ error: 'Ticket et OTP requis.' });
+  if (
+    typeof ticket !== 'string' || ticket.length > 100 ||
+    (typeof otp !== 'string' && typeof otp !== 'number') ||
+    !/^\d{6}$/.test(String(otp).trim())
+  ) {
+    return res.status(400).json({ error: 'Ticket et OTP invalides.' });
+  }
 
   const ticketData = mfaTickets.get(ticket);
   if (!ticketData) return res.status(401).json({ error: 'Ticket invalide ou expire.' });
@@ -311,7 +336,7 @@ router.post('/verify-mfa', async (req, res) => {
     return res.status(401).json({ error: 'Code OTP expire. Veuillez vous reconnecter.' });
   }
 
-  if (ticketData.otp !== otp.toString().trim()) {
+  if (!secureHashEquals(ticketData.otpHash, String(otp).trim())) {
     ticketData.attempts += 1;
     const isBlocked = ticketData.attempts >= 5;
     if (isBlocked) mfaTickets.delete(ticket);
@@ -336,9 +361,13 @@ router.post('/verify-mfa', async (req, res) => {
 
     const user = rows[0];
     const token = createAccessToken(user, logClientType);
-    const refreshToken = createRefreshToken(user.id);
-    const devId = deviceId || ticketData.deviceId || crypto.randomUUID();
-    const devName = deviceName || ticketData.deviceName || (logClientType === 'mobile_pwa' ? 'Terrain' : 'Web Portal');
+    const refreshToken = createRefreshToken(user.id, user.auth_version);
+    const devId = normalizeDeviceValue(deviceId, 100, ticketData.deviceId || crypto.randomUUID());
+    const devName = normalizeDeviceValue(
+      deviceName,
+      100,
+      ticketData.deviceName || (logClientType === 'mobile_pwa' ? 'Terrain' : 'Web Portal')
+    );
 
     await storeRefreshToken(pool, user.id, refreshToken, devId);
     await pool.query(
@@ -362,12 +391,14 @@ router.post('/verify-mfa', async (req, res) => {
 
     if (logClientType === 'web_portal') {
       setWebCookies(res, token, refreshToken);
+      return res.json({ user: await publicUser(user) });
     }
 
     return res.json({
       token,
+      accessToken: token,
       refreshToken,
-      user: publicUser(user)
+      user: await publicUser(user)
     });
   } catch (err) {
     console.error('[AUTH/VERIFY-MFA]', err);
@@ -377,11 +408,24 @@ router.post('/verify-mfa', async (req, res) => {
 
 router.post('/resend-mfa', async (req, res) => {
   const { ticket } = req.body;
-  if (!ticket) return res.status(400).json({ error: 'Ticket requis.' });
+  if (typeof ticket !== 'string' || !ticket || ticket.length > 100) {
+    return res.status(400).json({ error: 'Ticket invalide.' });
+  }
 
   const ticketData = mfaTickets.get(ticket);
   if (!ticketData) {
     return res.status(404).json({ error: 'Session de connexion expirée ou invalide. Veuillez vous reconnecter.' });
+  }
+  if (Date.now() > ticketData.expiry) {
+    mfaTickets.delete(ticket);
+    return res.status(401).json({ error: 'Session de connexion expiree. Veuillez vous reconnecter.' });
+  }
+  if (Date.now() - ticketData.lastSentAt < MFA_RESEND_COOLDOWN_MS) {
+    return res.status(429).json({ error: 'Veuillez patienter avant de demander un nouveau code.' });
+  }
+  if (ticketData.resendCount >= MFA_MAX_RESENDS) {
+    mfaTickets.delete(ticket);
+    return res.status(429).json({ error: 'Trop de codes demandes. Veuillez vous reconnecter.' });
   }
 
   try {
@@ -395,9 +439,11 @@ router.post('/resend-mfa', async (req, res) => {
     const otp = generateOTP();
     
     // Mettre à jour le ticket avec le nouvel OTP
-    ticketData.otp = otp;
-    ticketData.expiry = Date.now() + 10 * 60 * 1000; // Reset 10 minutes
-    ticketData.attempts = 0; // Reset attempts count
+    ticketData.otpHash = hashOtp(otp);
+    ticketData.expiry = Date.now() + MFA_TTL_MS;
+    ticketData.attempts = 0;
+    ticketData.resendCount += 1;
+    ticketData.lastSentAt = Date.now();
 
     const recipientEmail = user.email || `${user.username}@remontada.cm`;
     await sendOTPEmail(recipientEmail, user.username, otp);
@@ -511,7 +557,7 @@ router.post('/reset-password', async (req, res) => {
     const passwordHash = await bcrypt.hash(newPassword, 12);
     await connection.query(
       `UPDATE users
-       SET password = ?, failed_login_attempts = 0, blocked_until = NULL
+       SET password = ?, auth_version = auth_version + 1, failed_login_attempts = 0, blocked_until = NULL
        WHERE id = ?`,
       [passwordHash, resetToken.user_id]
     );
@@ -546,7 +592,7 @@ router.get('/me', authenticate, async (req, res) => {
       [req.user.id]
     );
     if (!rows.length) return res.status(401).json({ error: 'Session invalide.' });
-    return res.json({ user: publicUser(rows[0]) });
+    return res.json({ user: await publicUser(rows[0]) });
   } catch (err) {
     return res.status(500).json({ error: 'Erreur serveur.' });
   }
@@ -656,12 +702,14 @@ router.post('/refresh', async (req, res) => {
   const connection = await pool.getConnection();
   let transactionStarted = false;
   try {
-    const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+    const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET, { algorithms: JWT_ALGORITHMS });
+    await connection.beginTransaction();
+    transactionStarted = true;
     const [tokens] = await connection.query(
       `SELECT *
        FROM refresh_tokens
        WHERE token_hash = ? AND user_id = ? AND expires_at > NOW()
-       LIMIT 1`,
+       LIMIT 1 FOR UPDATE`,
       [hashToken(refreshToken), decoded.id]
     );
     if (!tokens.length) {
@@ -682,31 +730,38 @@ router.post('/refresh', async (req, res) => {
     }
 
     const user = users[0];
+    if (Number(decoded.authVersion || 0) !== Number(user.auth_version)) return res.status(401).json({ error: 'Session révoquée.' });
     const accessToken = createAccessToken(user, cookieSession ? 'web_portal' : 'mobile_pwa');
 
+    const rotatedRefreshToken = createRefreshToken(user.id, user.auth_version);
+    await connection.query('DELETE FROM refresh_tokens WHERE id = ?', [tokens[0].id]);
+    await storeRefreshToken(connection, user.id, rotatedRefreshToken, tokens[0].device_id);
+    await connection.commit();
+    transactionStarted = false;
+
     if (cookieSession) {
-      const rotatedRefreshToken = createRefreshToken(user.id);
-      await connection.beginTransaction();
-      transactionStarted = true;
-      await connection.query('DELETE FROM refresh_tokens WHERE id = ?', [tokens[0].id]);
-      await storeRefreshToken(connection, user.id, rotatedRefreshToken, tokens[0].device_id);
-      await connection.commit();
-      transactionStarted = false;
       setWebCookies(res, accessToken, rotatedRefreshToken);
-      return res.json({ user: publicUser(user) });
+      return res.json({ user: await publicUser(user) });
     }
 
-    return res.json({ accessToken });
+    return res.json({ accessToken, refreshToken: rotatedRefreshToken });
   } catch (err) {
     if (transactionStarted) await connection.rollback().catch(() => {});
     clearWebCookies(res);
     return res.status(401).json({ error: 'Refresh token invalide.' });
   } finally {
+    if (transactionStarted) await connection.rollback().catch(() => {});
     connection.release();
   }
 });
 
 router.post('/logout', async (req, res) => {
+  const access = req.cookies?.[ACCESS_COOKIE] || (req.headers.authorization || '').replace(/^Bearer /, '');
+  if (access) {
+    let decoded;
+    try { decoded = jwt.verify(access, JWT_SECRET, { algorithms: JWT_ALGORITHMS }); } catch { /* expired sessions already cannot be used */ }
+    if (decoded?.exp) await pool.query('INSERT IGNORE INTO revoked_access_tokens (token_hash, expires_at) VALUES (?, FROM_UNIXTIME(?))', [hashToken(access), decoded.exp]);
+  }
   const refreshToken = req.cookies?.[REFRESH_COOKIE] || req.body?.refreshToken;
   if (refreshToken) {
     await pool.query(
@@ -720,9 +775,9 @@ router.post('/logout', async (req, res) => {
 
 router.post('/toggle-mfa', authenticate, async (req, res) => {
   const { enabled } = req.body;
-  if (enabled === undefined) return res.status(400).json({ error: 'Statut MFA requis.' });
+  if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'Statut MFA invalide.' });
   try {
-    const mfaEnabledVal = Boolean(enabled);
+    const mfaEnabledVal = enabled;
     await pool.query('UPDATE users SET mfa_enabled = ? WHERE id = ?', [mfaEnabledVal, req.user.id]);
     
     // Log target action for audit log
@@ -731,7 +786,7 @@ router.post('/toggle-mfa', authenticate, async (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?)`,
       [
         req.user.id,
-        'PUT /api/auth/toggle-mfa',
+        'POST /api/v1/auth/toggle-mfa',
         'auth',
         JSON.stringify({ mfa_enabled: !mfaEnabledVal }),
         JSON.stringify({ mfa_enabled: mfaEnabledVal }),

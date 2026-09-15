@@ -574,4 +574,4 @@ class OpportunityWorkflowService {
   }
 }
 
-module.exports = OpportunityWorkflowService;
+module.exports = require('../utils/transactionalWorkflow')(OpportunityWorkflowService, 'crm_opportunities', ["getOpportunity","canAccess","logHistory"]);

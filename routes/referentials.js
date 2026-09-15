@@ -83,6 +83,16 @@ async function handleUpdate(table, fields, req, res) {
 async function handleDelete(table, req, res) {
   try {
     const { id } = req.params;
+    const dependencies = {
+      crm_ref_countries: [['crm_ref_regions','country_id']],
+      crm_ref_regions: [['crm_ref_departments','region_id'],['crm_institutions','region_id'],['crm_missions','region_id']],
+      crm_ref_departments: [['crm_ref_cities','department_id'],['crm_institutions','department_id'],['crm_missions','department_id']],
+      crm_ref_cities: [['users','base_city_id'],['crm_institutions','city_id'],['crm_missions','city_id'],['crm_missions','base_city_id']]
+    };
+    for (const [child, foreignKey] of dependencies[table] || []) {
+      const [linked] = await pool.query(`SELECT 1 FROM ${child} WHERE ${foreignKey}=? LIMIT 1`,[id]);
+      if (linked.length) return res.status(400).json({error:'Impossible de supprimer cet élément : des lieux ou dossiers lui sont encore rattachés.'});
+    }
     const [result] = await pool.query(`DELETE FROM ${table} WHERE id = ?`, [id]);
 
     if (result.affectedRows === 0) {
@@ -341,4 +351,3 @@ router.delete('/documentary-observations/:id', authenticate, authorize('SYSTEM',
 );
 
 module.exports = router;
-

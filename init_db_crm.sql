@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS users (
     is_verified BOOLEAN DEFAULT FALSE,
     is_active BOOLEAN DEFAULT TRUE,
     job_description_id INT,
+    base_city_id INT NULL,
     mfa_secret VARCHAR(255) DEFAULT NULL,
     mfa_enabled BOOLEAN DEFAULT FALSE,
     failed_login_attempts INT DEFAULT 0,
@@ -150,7 +151,11 @@ CREATE TABLE IF NOT EXISTS crm_objectives (
     target_team VARCHAR(50) DEFAULT NULL,
     target_qty DECIMAL(15,2) DEFAULT NULL,
     target_qty_unit VARCHAR(50) DEFAULT 'FCFA',
+    objective_nature ENUM('QUANTITATIVE', 'QUALITATIVE') NOT NULL DEFAULT 'QUANTITATIVE',
     target_qlty TEXT,
+    qualitative_criteria JSON DEFAULT NULL,
+    qualitative_rating ENUM('NOT_ACHIEVED', 'UNDER_EXPECTATIONS', 'ACHIEVED', 'EXCEEDED') DEFAULT NULL,
+    qualitative_evidence TEXT DEFAULT NULL,
     status ENUM('DRAFT', 'SUBMITTED', 'VALIDATED', 'ASSIGNED', 'IN_PROGRESS', 'ACHIEVED', 'NOT_ACHIEVED', 'CLOSED', 'CANCELLED') DEFAULT 'DRAFT',
     created_by INT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -217,6 +222,14 @@ CREATE TABLE IF NOT EXISTS crm_missions (
     region_id INT NOT NULL,
     department_id INT NOT NULL,
     city_id INT NOT NULL,
+    base_city_id INT NULL,
+    client_request_id VARCHAR(36) UNIQUE NULL,
+    travel_scope ENUM('IN_CITY', 'OUT_OF_CITY') NULL,
+    departure_at DATETIME NULL,
+    return_at DATETIME NULL,
+    transport_mode VARCHAR(40) NULL,
+    accommodation_required BOOLEAN NOT NULL DEFAULT FALSE,
+    estimated_travel_cost DECIMAL(15,2) NOT NULL DEFAULT 0,
     status ENUM('DRAFT', 'SUBMITTED', 'IN_VALIDATION', 'VALIDATED', 'PLANNED', 'IN_PROGRESS', 'COMPLETED', 'CLOSED', 'REJECTED', 'CANCELLED', 'POSTPONED') DEFAULT 'DRAFT',
     rejection_reason TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -235,6 +248,26 @@ CREATE TABLE IF NOT EXISTS crm_mission_associates (
     PRIMARY KEY (mission_id, user_id),
     FOREIGN KEY (mission_id) REFERENCES crm_missions(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS crm_mission_targets (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    mission_id INT NOT NULL,
+    institution_id INT NOT NULL,
+    visit_order INT NOT NULL DEFAULT 1,
+    priority ENUM('LOW', 'MEDIUM', 'HIGH') NOT NULL DEFAULT 'MEDIUM',
+    potential ENUM('LOW', 'MEDIUM', 'HIGH') NOT NULL DEFAULT 'MEDIUM',
+    contact_name VARCHAR(150) NULL,
+    contact_role VARCHAR(120) NULL,
+    contact_phone VARCHAR(40) NULL,
+    contact_email VARCHAR(190) NULL,
+    notes TEXT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_mission_target_institution (mission_id, institution_id),
+    KEY idx_mission_targets_order (mission_id, visit_order),
+    FOREIGN KEY (mission_id) REFERENCES crm_missions(id) ON DELETE CASCADE,
+    FOREIGN KEY (institution_id) REFERENCES crm_institutions(id) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- =====================================================
@@ -257,6 +290,26 @@ CREATE TABLE IF NOT EXISTS crm_opportunities (
     FOREIGN KEY (institution_id) REFERENCES crm_institutions(id) ON DELETE RESTRICT,
     FOREIGN KEY (mission_id) REFERENCES crm_missions(id) ON DELETE SET NULL,
     FOREIGN KEY (assigned_to) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS crm_mission_target_opportunities (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    mission_target_id INT NOT NULL UNIQUE,
+    title VARCHAR(150) NOT NULL,
+    need_description TEXT NOT NULL,
+    proposed_solution TEXT NULL,
+    estimated_amount DECIMAL(15,2) NOT NULL DEFAULT 0,
+    priority ENUM('LOW', 'MEDIUM', 'HIGH') NOT NULL DEFAULT 'MEDIUM',
+    maturity ENUM('DISCOVERY', 'QUALIFIED', 'PROPOSAL', 'NEGOTIATION', 'DECISION') NOT NULL DEFAULT 'DISCOVERY',
+    expected_deadline DATE NULL,
+    tender_reference VARCHAR(120) NULL,
+    current_supplier VARCHAR(160) NULL,
+    notes TEXT NULL,
+    linked_opportunity_id INT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (mission_target_id) REFERENCES crm_mission_targets(id) ON DELETE CASCADE,
+    FOREIGN KEY (linked_opportunity_id) REFERENCES crm_opportunities(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- =====================================================

@@ -3,7 +3,7 @@ const router = express.Router();
 const pool = require('../db');
 const { authenticate } = require('../middleware/auth');
 
-// GET /api/notifications — Récupérer toutes les notifications de l'utilisateur connecté
+// GET /api/notifications - Récupérer toutes les notifications de l'utilisateur connecté
 router.get('/', authenticate, async (req, res) => {
   try {
     const [rows] = await pool.query(
@@ -17,7 +17,7 @@ router.get('/', authenticate, async (req, res) => {
   }
 });
 
-// POST /api/notifications/:id/read — Marquer une notification comme lue
+// POST /api/notifications/:id/read - Marquer une notification comme lue
 router.post('/:id/read', authenticate, async (req, res) => {
   try {
     await pool.query(

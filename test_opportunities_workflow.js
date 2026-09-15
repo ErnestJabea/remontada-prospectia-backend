@@ -13,6 +13,7 @@ async function runTests() {
   const manager = { id: 2, role: 'DIRECTION', full_name: 'Directeur Remontada' };
 
   let opportunityId = null;
+  let followUpMissionId = null;
 
   try {
     // 1. Création d'une opportunité
@@ -124,6 +125,7 @@ async function runTests() {
       department_id: 1,
       city_id: 1
     });
+    followUpMissionId = missionRes.missionId;
     console.log('✅ Mission de suivi créée :', missionRes);
 
     // Vérifier la liaison M-to-N
@@ -149,6 +151,9 @@ async function runTests() {
     console.error('❌ Échec du test :', error.message);
     process.exitCode = 1;
   } finally {
+    if (followUpMissionId) {
+      await pool.query('DELETE FROM crm_missions WHERE id = ?', [followUpMissionId]);
+    }
     // Nettoyage de l'opportunité de test
     if (opportunityId) {
       console.log('\n🧹 Nettoyage des données de test...');

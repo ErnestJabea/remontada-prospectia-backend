@@ -1,3 +1,4 @@
+const canLinkRecord = require('../utils/linkedAccess');
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
@@ -7,6 +8,7 @@ const pool = require('../db');
 const { authenticate } = require('../middleware/auth');
 const ReportWorkflowService = require('../services/reportWorkflow');
 const ReportPdfService = require('../services/reportPdfService');
+const { deleteStoredUpload, sendStoredUpload, validateUploadedFilesContent } = require('../utils/uploadSecurity');
 
 const router = express.Router();
 const MANAGER_ROLES = new Set(['DIRECTION', 'SYSTEM', 'ADMIN']);
@@ -49,7 +51,7 @@ function isManager(user) {
 
 function cleanupUploadedFiles(files = []) {
   for (const file of files) {
-    if (file.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+    if (file.path) deleteStoredUpload(file.path);
   }
 }
 
@@ -85,7 +87,7 @@ router.get('/', authenticate, async (req, res) => {
     const conditions = [];
 
     // Role-based restrictions
-    if (req.user.role === 'COMMERCIAL') {
+    if (req.user.role === 'COMMERCIAL' || req.user.restrictFeatureScope) {
       conditions.push('(rp.commercial_id = ? OR m.primary_commercial_id = ?)');
       params.push(req.user.id, req.user.id);
     } else if (commercial_id) {
@@ -214,6 +216,7 @@ router.post('/', authenticate, async (req, res) => {
   } = req.body;
 
   try {
+    if (!await canLinkRecord(req.user,'missions',mission_id) || !await canLinkRecord(req.user,'objectives',objective_id)) return res.status(403).json({error:'Mission ou objectif inaccessible.'});
     const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     const defaultType = report_type || 'activity_report';
 
@@ -271,21 +274,19 @@ router.put('/:id', authenticate, async (req, res) => {
   try {
     const access = await getReportAccess(req.params.id, req.user);
     if (!access.report) {
-      conn.release();
       return res.status(404).json({ error: 'Rapport introuvable.' });
     }
     if (!access.allowed) {
-      conn.release();
       return res.status(403).json({ error: 'Acces refuse.' });
     }
 
     // Enforce workflow restrictions: non-managers can only edit if report is in draft/to-correct status
     const editableStatuses = ['BROUILLON_AUTO', 'A_COMPLETER', 'CORRECTION_DEMANDEE', 'DRAFT', 'REJECTED'];
     if (!isManager(req.user) && !editableStatuses.includes(access.report.status)) {
-      conn.release();
       return res.status(409).json({ error: 'Modification impossible sur un rapport soumis ou validé.' });
     }
 
+    if (!await canLinkRecord(req.user,'objectives',objective_id)) return res.status(403).json({error:'Objectif inaccessible.'});
     await conn.beginTransaction();
 
     // 1. Update crm_reports table
@@ -487,7 +488,9 @@ router.get('/:id/download-pdf', authenticate, async (req, res) => {
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="rapport-${access.report.code || req.params.id}.pdf"`);
-    return res.sendFile(finalPath);
+    const pdfRoot = path.resolve(__dirname, '..', 'uploads', 'reports', 'pdf');
+    if (path.dirname(path.resolve(finalPath)) !== pdfRoot) return res.status(403).json({error:'Chemin de rapport non autorisé.'});
+    return res.sendFile(path.basename(finalPath), {root:pdfRoot});
   } catch (err) {
     console.error('[REPORTS/DOWNLOAD_PDF]', err);
     return res.status(500).json({ error: 'Impossible de generer ou telecharger le PDF.' });
@@ -586,6 +589,10 @@ router.post('/:id/attachments', authenticate, upload.array('files', 5), async (r
       return res.status(403).json({ error: 'Acces refuse.' });
     }
     if (!req.files?.length) return res.status(400).json({ error: 'Aucun fichier fourni.' });
+    if (!validateUploadedFilesContent(req.files)) {
+      cleanupUploadedFiles(req.files);
+      return res.status(400).json({ error: 'Contenu de fichier non autorise.' });
+    }
 
     const inserts = req.files.map(file => [
       req.params.id,
@@ -621,10 +628,12 @@ router.get('/:id/attachments/:attId/download', authenticate, async (req, res) =>
        WHERE id = ? AND report_id = ?`,
       [req.params.attId, req.params.id]
     );
-    if (!rows.length || !fs.existsSync(rows[0].file_path)) {
+    if (!rows.length) {
       return res.status(404).json({ error: 'Piece jointe introuvable.' });
     }
-    return res.download(path.resolve(rows[0].file_path), rows[0].file_name);
+    if (!sendStoredUpload(res, rows[0].file_path, rows[0].file_name)) {
+      return res.status(404).json({ error: 'Piece jointe introuvable.' });
+    }
   } catch (err) {
     console.error('[REPORTS/DOWNLOAD_ATTACHMENT]', err);
     return res.status(500).json({ error: 'Erreur serveur.' });
@@ -647,7 +656,7 @@ router.delete('/:id/attachments/:attId', authenticate, async (req, res) => {
       [req.params.attId, req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Piece jointe introuvable.' });
-    if (fs.existsSync(rows[0].file_path)) fs.unlinkSync(rows[0].file_path);
+    deleteStoredUpload(rows[0].file_path);
     await pool.query(
       'DELETE FROM crm_report_attachments WHERE id = ? AND report_id = ?',
       [req.params.attId, req.params.id]

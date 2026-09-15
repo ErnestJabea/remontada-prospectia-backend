@@ -16,6 +16,7 @@ async function runTests() {
 
   let testMissionId = null;
   let testReportId = null;
+  let generatedPdfPath = null;
 
   try {
     // 1. Create a fake mission in IN_PROGRESS status
@@ -97,9 +98,9 @@ async function runTests() {
 
     // 9. Generate PDF
     console.log('\n--- Step 9: Generating PDF ---');
-    const pdfPath = await ReportPdfService.generatePdf(testReportId);
-    console.log(`✅ PDF generated successfully. Path: ${pdfPath}`);
-    if (fs.existsSync(pdfPath)) {
+    generatedPdfPath = await ReportPdfService.generatePdf(testReportId);
+    console.log(`✅ PDF generated successfully. Path: ${generatedPdfPath}`);
+    if (fs.existsSync(generatedPdfPath)) {
       console.log('  File exists on disk.');
     } else {
       console.error('❌ File NOT found on disk.');
@@ -117,6 +118,10 @@ async function runTests() {
   } finally {
     // Cleanup fake test records
     console.log('\n--- Cleaning up test records ---');
+    if (generatedPdfPath && fs.existsSync(generatedPdfPath)) {
+      fs.unlinkSync(generatedPdfPath);
+      console.log('  Deleted test PDF file.');
+    }
     if (testReportId) {
       await pool.query('DELETE FROM crm_report_histories WHERE activity_report_id = ?', [testReportId]);
       await pool.query('DELETE FROM crm_report_comments WHERE activity_report_id = ?', [testReportId]);

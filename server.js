@@ -5,9 +5,29 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
+const { authenticate } = require('./middleware/auth');
+const { requireFeature } = require('./middleware/featureAccess');
+const {
+  API_VERSION,
+  apiError,
+  apiRequestContext,
+  apiVersionHeaders,
+  validateApiRequest
+} = require('./middleware/apiSecurity');
+
 const app = express();
-app.set('trust proxy', 1); // Un seul proxy de confiance devant Node.js (Nginx)
 const PORT = process.env.PORT || 3002;
+const isProduction = process.env.NODE_ENV === 'production';
+const API_HOST = process.env.API_HOST || (isProduction ? '0.0.0.0' : '127.0.0.1');
+const configuredProxyHops = Number(process.env.TRUST_PROXY_HOPS || 0);
+const bodyLimit = /^\d+(?:kb|mb)$/i.test(process.env.API_BODY_LIMIT || '')
+  ? process.env.API_BODY_LIMIT
+  : '512kb';
+
+app.set('trust proxy', Number.isInteger(configuredProxyHops) && configuredProxyHops > 0
+  ? configuredProxyHops
+  : false);
+app.set('query parser', 'simple');
 
 for (const requiredSecret of ['JWT_SECRET', 'JWT_REFRESH_SECRET']) {
   if (!process.env[requiredSecret] || process.env[requiredSecret].length < 32) {
@@ -28,11 +48,14 @@ const allowedOrigins = [
 
 app.disable('x-powered-by');
 app.use(helmet({
-  crossOriginResourcePolicy: { policy: 'same-site' }
+  crossOriginResourcePolicy: { policy: 'same-site' },
+  hsts: isProduction ? { maxAge: 31536000, includeSubDomains: true } : false,
+  referrerPolicy: { policy: 'no-referrer' }
 }));
+app.use('/api', apiRequestContext);
 app.use(cookieParser());
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+app.use(express.json({ limit: bodyLimit, strict: true }));
+app.use(express.urlencoded({ extended: false, limit: bodyLimit, parameterLimit: 100 }));
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -43,8 +66,15 @@ app.use(cors({
     error.status = 403;
     return callback(error);
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'X-Request-ID'],
+  exposedHeaders: ['X-Request-ID', 'X-API-Version', 'Deprecation', 'Link', 'RateLimit', 'RateLimit-Policy'],
+  maxAge: 600,
+  optionsSuccessStatus: 204
 }));
+
+app.use('/api', validateApiRequest);
 
 // SameSite protege les navigateurs modernes. Ce controle d'origine ajoute une
 // barriere explicite aux requetes d'ecriture authentifiees par cookie.
@@ -61,6 +91,9 @@ app.use((req, res, next) => {
 });
 
 const disableApiRateLimit = process.env.API_RATE_LIMIT_DISABLED === 'true' || process.env.DISABLE_RATE_LIMIT === 'true';
+if (isProduction && disableApiRateLimit) {
+  throw new Error('Le rate limiting ne peut pas etre desactive en production.');
+}
 if (disableApiRateLimit) {
   console.warn('[SECURITY] Rate limiting API desactive via API_RATE_LIMIT_DISABLED=true.');
 } else {
@@ -89,10 +122,11 @@ if (disableApiRateLimit) {
   });
 
   app.use('/api/', limiter);
-  app.use('/api/auth/login', loginLimiter);
-  app.use('/api/auth/verify-mfa', loginLimiter);
-  app.use('/api/auth/forgot-password', passwordResetLimiter);
-  app.use('/api/auth/reset-password', passwordResetLimiter);
+  app.use(['/api/v1/auth/login', '/api/auth/login'], loginLimiter);
+  app.use(['/api/v1/auth/verify-mfa', '/api/auth/verify-mfa'], loginLimiter);
+  app.use(['/api/v1/auth/resend-mfa', '/api/auth/resend-mfa'], loginLimiter);
+  app.use(['/api/v1/auth/forgot-password', '/api/auth/forgot-password'], passwordResetLimiter);
+  app.use(['/api/v1/auth/reset-password', '/api/auth/reset-password'], passwordResetLimiter);
 }
 
 const authRoutes = require('./routes/auth');
@@ -108,43 +142,89 @@ const notificationsRoutes = require('./routes/notifications');
 const securityRoutes = require('./routes/security');
 const permissionsRoutes = require('./routes/permissions');
 
-app.use('/api/auth', authRoutes);
-app.use('/api/users', usersRoutes);
-app.use('/api/referentials', referentialsRoutes);
-app.use('/api/objectives', objectivesRoutes);
-app.use('/api/institutions', institutionsRoutes);
-app.use('/api/missions', missionsRoutes);
-app.use('/api/opportunities', opportunitiesRoutes);
-app.use('/api/reports', reportsRoutes);
-app.use('/api/sync', syncRoutes);
-app.use('/api/notifications', notificationsRoutes);
-app.use('/api/security', securityRoutes);
-app.use('/api/permissions', permissionsRoutes);
-
-app.get('/api/health', (req, res) => {
+function healthHandler(req, res) {
   res.json({
     status: 'ok',
     service: 'ERP Remontada Prospectia API',
-    version: '1.0.0',
+    apiVersion: API_VERSION,
+    serviceVersion: require('./package.json').version,
     timestamp: new Date().toISOString(),
     port: PORT
   });
+}
+
+function createApiRouter({ deprecated = false } = {}) {
+  const router = express.Router();
+  router.use(apiVersionHeaders({ deprecated }));
+  router.get('/health', healthHandler);
+  router.use('/auth', authRoutes);
+
+  // Toutes les ressources metier sont privees par defaut. La page de controle
+  // d'un ordre reste publique car son jeton aleatoire fait office de preuve.
+  router.use((req, res, next) => {
+    const publicMissionVerification = req.method === 'GET' &&
+      /^\/missions\/\d+\/order\/verify$/.test(req.path);
+    if (publicMissionVerification) return next();
+    return authenticate(req, res, next);
+  });
+
+  router.use('/users', requireFeature('users'), usersRoutes);
+  router.use('/referentials', requireFeature('referentials'), referentialsRoutes);
+  router.use('/objectives', requireFeature('objectives'), objectivesRoutes);
+  router.use('/institutions', requireFeature('institutions'), institutionsRoutes);
+  router.use('/missions', (req,res,next) => !req.user && req.method === 'GET' && /^\/\d+\/order\/verify$/.test(req.path) ? next() : requireFeature('missions')(req,res,next), missionsRoutes);
+  router.use('/opportunities', requireFeature('opportunities'), opportunitiesRoutes);
+  router.use('/reports', requireFeature('reports'), reportsRoutes);
+  router.use('/sync', syncRoutes);
+  router.use('/notifications', notificationsRoutes);
+  router.use('/security', requireFeature('security'), securityRoutes);
+  router.use('/permissions', permissionsRoutes);
+  router.use('/analytics', require('./routes/analytics'));
+  return router;
+}
+
+app.use('/api/v1', createApiRouter());
+const legacyApiRouter = createApiRouter({ deprecated: true });
+app.use('/api', (req, res, next) => {
+  if (/^\/v\d+(?:\/|$)/.test(req.path)) {
+    return apiError(res, 404, 'API_VERSION_UNSUPPORTED', 'Version d\'API inexistante ou non prise en charge.');
+  }
+  return legacyApiRouter(req, res, next);
 });
 
 app.use((err, req, res, next) => {
-  console.error('[ERROR]', err);
   const status = err.status || 500;
-  const message = status < 500 ? err.message : 'Erreur serveur interne.';
-  res.status(status).json({ error: message });
+  const malformedJson = err instanceof SyntaxError && err.type === 'entity.parse.failed';
+  const resolvedStatus = malformedJson ? 400 : status;
+  if (resolvedStatus >= 500) {
+    console.error(`[ERROR][${req.requestId || 'sans-request-id'}]`, err);
+  } else {
+    console.warn(`[REQUEST_REJECTED][${req.requestId || 'sans-request-id'}] status=${resolvedStatus}`);
+  }
+  const message = malformedJson
+    ? 'Corps JSON invalide.'
+    : (resolvedStatus < 500 ? err.message : 'Erreur serveur interne.');
+  return apiError(
+    res,
+    resolvedStatus,
+    malformedJson ? 'INVALID_JSON' : (err.code || 'REQUEST_FAILED'),
+    message
+  );
 });
 
 app.use((req, res) => {
-  res.status(404).json({ error: `Route non trouvee : ${req.method} ${req.path}` });
+  return apiError(res, 404, 'ROUTE_NOT_FOUND', `Route non trouvee : ${req.method} ${req.path}`);
 });
 
-app.listen(PORT, () => {
-  console.log(`ERP Remontada Prospectia API disponible sur le port ${PORT}`);
-});
+if (require.main === module) {
+  const server = app.listen(PORT, API_HOST);
+  server.once('listening', () => {
+    console.log(`ERP Remontada Prospectia API v${API_VERSION} disponible sur ${API_HOST}:${PORT}`);
+  });
+  server.once('error', error => {
+    console.error(`Impossible de lancer l'API sur ${API_HOST}:${PORT}: ${error.code || error.message}`);
+    process.exitCode = 1;
+  });
+}
 
 module.exports = app;
-// reload crm cnf, routes, and mailer
