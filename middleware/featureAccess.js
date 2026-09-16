@@ -25,7 +25,15 @@ function requireFeature(defaultFeature) {
     try {
       const feature = defaultFeature === 'objectives' && /^\/(domains|kpis)(\/|$)/.test(req.path) ? 'kpis' : defaultFeature;
       const operation = ['GET','HEAD'].includes(req.method) ? 'can_view' : req.method === 'DELETE' ? 'can_delete' : req.method === 'POST' && (req.path === '/' || req.path === '/proposals' || req.path.startsWith('/generate')) ? 'can_create' : 'can_update';
-      assertFeature(req.user,feature,operation);
+      // Objective users need these lookup lists to propose an objective.
+      // Editing the catalog still requires the administrative KPI permission.
+      const objectiveLookup = defaultFeature === 'objectives' && ['GET','HEAD'].includes(req.method) && /^\/(domains|kpis)\/?$/.test(req.path);
+      if (objectiveLookup) {
+        try { assertFeature(req.user,'objectives','can_view'); }
+        catch { assertFeature(req.user,feature,operation); }
+      } else {
+        assertFeature(req.user,feature,operation);
+      }
       if (/\/(assign|affectations)(\/|$)/.test(req.path)) assertFeature(req.user,feature,'can_reorganize');
       const permission = permissionFor(req.user,feature);
       req.user.restrictFeatureScope = Boolean(permission && !permission.can_view_all);

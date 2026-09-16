@@ -35,6 +35,7 @@ async function main() {
   process.env.FRONTEND_ORIGINS = '';
   pool = require('./db');
   await require('./migrate_workflow_integrity')();
+  await require('./migrate_notifications')();
   const hash = await require('bcryptjs').hash(password,12);
   await pool.query("INSERT INTO crm_ref_countries (id,code,name,name_en) VALUES (1,'CM','Pays test','Test country')");
   await pool.query("INSERT INTO crm_ref_regions (id,code,name,name_en,country_id) VALUES (1,'R1','Région test','Test region',1)");
@@ -98,9 +99,24 @@ async function main() {
       await call('/objectives/'+id+'/proposal',commercial,'PUT',payload);
       await call('/objectives/'+id+'/submit',commercial,'POST',{});
       await call('/objectives/'+id+'/validate',manager,'POST',{action:'VALIDATE'});
+      for (const viewer of [manager, commercial]) {
+        const detail = (await call('/objectives/'+id,viewer)).data;
+        assert.equal(detail.status,'VALIDATED','Validated objective detail must update immediately');
+        assert.equal(detail.creation_source,'FIELD');
+        const list = (await call('/objectives',viewer)).data;
+        assert.equal(list.find(item=>item.id===id)?.status,'VALIDATED','Validated objective list must update immediately');
+      }
+      await call('/objectives/'+id+'/assign',manager,'POST',{affectations:[{type:'COMMERCIAL',target_id:4,value_allocated:1}]},409);
       const [[row]]=await pool.query('SELECT responsible_id,objective_nature FROM crm_objectives WHERE id=?',[id]);
       assert.equal(row.responsible_id,3);assert.equal(row.objective_nature,kpi===1?'QUANTITATIVE':'QUALITATIVE');
     }
+  });
+  await check('backoffice objective validation retains assignment distinction',async()=>{
+    await pool.query("UPDATE crm_objectives SET status='SUBMITTED' WHERE id=1");
+    await call('/objectives/1/validate',manager,'POST',{action:'VALIDATE'});
+    const detail=(await call('/objectives/1',manager)).data;
+    assert.equal(detail.status,'ASSIGNED');assert.equal(detail.creation_source,'BACKOFFICE');
+    await pool.query("UPDATE crm_objectives SET status='IN_PROGRESS' WHERE id=1");
   });
   let missionId, reportId;
   await check('mission draft, correction, validation, start, completion and automatic report',async()=>{
@@ -235,15 +251,76 @@ async function main() {
     await pool.query("INSERT INTO job_feature_permissions(job_description_id,module_id,feature_id,can_view,can_create,can_update,can_delete,can_view_all,can_reorganize) VALUES(1,'crm','opportunities',1,0,0,0,0,0)");
     await pool.query('UPDATE users SET job_description_id=1 WHERE id=4');
     await call('/opportunities',other);
+    await call('/objectives/domains',other,'GET',undefined,403);
+    await call('/objectives/kpis',other,'GET',undefined,403);
+    await pool.query("INSERT INTO job_feature_permissions(job_description_id,module_id,feature_id,can_view,can_create,can_update,can_delete,can_view_all,can_reorganize) VALUES(1,'crm','objectives',1,1,0,0,0,0)");
+    await call('/objectives/domains',other);
+    await call('/objectives/kpis',other);
+    await call('/objectives/domains',other,'POST',{code:'DENIED',name:'Interdit'},403);
+    await call('/objectives/kpis/1',other,'PUT',{name:'Interdit'},403);
     await call('/opportunities',other,'POST',{institution_id:1,title:'Interdit',need_description:'Besoin',estimated_amount:10},403);
     const denied=(await call('/sync/push',other,'POST',{actions:[{id:'sync_'+crypto.randomUUID(),type:'opportunity',action:'create',payload:{institution_id:1,title:'Interdit',need_description:'Besoin',estimated_amount:10}}]})).data;
     assert.equal(denied.results[0].status,'error');
     const profile=(await call('/auth/me',other)).data.user;
-    assert.equal(profile.job_description_id,1);assert.equal(profile.jobPermissions[0].can_create,0);
+    assert.equal(profile.job_description_id,1);assert.equal(profile.jobPermissions.find(p=>p.feature_id==='opportunities').can_create,0);
     await call('/permissions/job-descriptions/1/feature',admin,'PUT',{module_id:'crm',feature_id:'opportunities',can_view:true,can_create:true,can_update:false,can_delete:false,can_view_all:false,can_reorganize:false});
     const permissions=(await call('/permissions/job-descriptions/1',admin)).data.permissions;
     assert.equal(permissions.find(p=>p.feature_id==='opportunities').can_create,1);
     await pool.query('UPDATE users SET job_description_id=NULL WHERE id=4');
+  });
+  await check('objective realtime stream, transactional outbox, retry and push ownership',async()=>{
+    const {notifyUser}=require('./utils/notifications');
+    const {deliverPending,validSubscription}=require('./utils/notificationDelivery');
+    const webpush=require('web-push');
+    const originalPush=webpush.sendNotification,originalMail=mail.sendNotificationEmail;
+    const subscription={endpoint:'https://fcm.googleapis.com/fcm/send/fixture',keys:{p256dh:Buffer.alloc(65,1).toString('base64url'),auth:Buffer.alloc(16,1).toString('base64url')}};
+    assert.equal(validSubscription({...subscription,endpoint:'http://127.0.0.1/private'}),false);
+    await call('/notifications/subscriptions',commercial,'POST',subscription);
+    await call('/notifications/subscriptions',other,'DELETE',{endpoint:subscription.endpoint});
+    const [[owned]]=await pool.query('SELECT COUNT(*) n FROM notification_push_subscriptions WHERE user_id=3');assert.equal(owned.n,1);
+    await call('/notifications/subscriptions',commercial,'POST',{...subscription,endpoint:'https://127.0.0.1/private'},400);
+    await pool.query("UPDATE notification_deliveries SET status='skipped'");
+    const [[before]]=await pool.query('SELECT COUNT(*) n FROM notification_deliveries');
+    await assert.rejects(pool.withTransaction(async()=>{await notifyUser(3,'Rollback','Not delivered','OBJECTIVE_VALIDATED',1);throw new Error('rollback');}));
+    const [[after]]=await pool.query('SELECT COUNT(*) n FROM notification_deliveries');assert.equal(after.n,before.n);
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),15000);
+    try {
+      const stream=await fetch(origin+'/notifications/stream',{headers:{Authorization:'Bearer '+commercial.token},signal:controller.signal});
+      assert.equal(stream.status,200);assert.match(stream.headers.get('content-type'),/text\/event-stream/);
+      const reader=stream.body.getReader(),decoder=new TextDecoder();let buffer='';
+      async function event() {
+        while(true) {
+          let end;
+          while((end=buffer.indexOf('\n\n'))!==-1) {
+            const frame=buffer.slice(0,end);buffer=buffer.slice(end+2);
+            if(frame.startsWith('data: ')) return JSON.parse(frame.slice(6));
+          }
+          const chunk=await reader.read();assert.equal(chunk.done,false);buffer+=decoder.decode(chunk.value,{stream:true});
+        }
+      }
+      const initial=await event();assert.ok(initial.notifications.every(n=>n.user_id===3));
+      await notifyUser(4,'Other user','Private','OBJECTIVE_VALIDATED',1);
+      await notifyUser(3,'Realtime fixture','Updated','OBJECTIVE_VALIDATED',1);
+      const updated=await event();assert.ok(updated.notifications.some(n=>n.title==='Realtime fixture'));assert.ok(updated.notifications.every(n=>n.user_id===3));
+    } finally {clearTimeout(timer);controller.abort();}
+    let mails=0,pushes=0,fail=true;
+    mail.sendNotificationEmail=async()=>{mails++;if(fail)throw Object.assign(new Error('Temporary SMTP failure'),{code:'ETIMEDOUT'});};
+    webpush.sendNotification=async()=>{pushes++;return {statusCode:201};};
+    try {
+      await deliverPending();
+      const [[retry]]=await pool.query("SELECT COUNT(*) n FROM notification_deliveries WHERE channel='email' AND status='pending' AND attempts=1");assert.equal(retry.n,2);
+      assert.equal(pushes,1);
+      fail=false;await pool.query("UPDATE notification_deliveries SET next_attempt_at=NOW() WHERE status='pending'");
+      await deliverPending();assert.equal(mails,4);
+      const [[sent]]=await pool.query("SELECT COUNT(*) n FROM notification_deliveries WHERE status='sent'");assert.equal(sent.n,3);
+      await pool.query('UPDATE users SET settings=? WHERE id=3',[JSON.stringify({notifications:{email:false,push:false}})]);
+      await notifyUser(3,'Disabled','No external delivery','OBJECTIVE_CLOSED',1);await deliverPending();assert.equal(mails,4);assert.equal(pushes,1);
+      await pool.query('UPDATE users SET settings=NULL WHERE id=3');
+      webpush.sendNotification=async()=>{throw {statusCode:410};};
+      await notifyUser(3,'Expired subscription','Cleanup','OBJECTIVE_CLOSED',1);await deliverPending();
+      const [[remaining]]=await pool.query('SELECT COUNT(*) n FROM notification_push_subscriptions');assert.equal(remaining.n,0);
+    } finally {webpush.sendNotification=originalPush;mail.sendNotificationEmail=originalMail;}
   });
   await check('refresh is single-use under concurrency and logout revokes access',async()=>{
     const session=await login(4,true);

@@ -19,6 +19,9 @@ const isConfigured = Boolean(
 const transporter = isConfigured
   ? nodemailer.createTransport({
       host: SMTP_HOST,
+      connectionTimeout: 10000,
+      greetingTimeout: 10000,
+      socketTimeout: 20000,
       port: SMTP_PORT,
       secure: SMTP_SECURE,
       auth: {
@@ -144,4 +147,15 @@ async function sendInitialPasswordSetupEmail(to, user) {
   }
 }
 
-module.exports = { sendOTPEmail, sendPasswordResetEmail, sendInitialPasswordSetupEmail };
+async function sendNotificationEmail(to, title, message, notificationId) {
+  if (!transporter) throw Object.assign(new Error('SMTP_NOT_CONFIGURED'), {code:'SMTP_NOT_CONFIGURED'});
+  const result = await transporter.sendMail({from:SMTP_FROM, to, subject:title, text:message,
+    messageId:`<objective-notification-${notificationId}@remontada.cm>`});
+  if (!result.accepted?.length) throw new Error('SMTP_NOT_ACCEPTED');
+}
+async function verifyNotificationMail() {
+  if (!transporter) return false;
+  await transporter.verify();
+  return true;
+}
+module.exports = { sendNotificationEmail, verifyNotificationMail, sendOTPEmail, sendPasswordResetEmail, sendInitialPasswordSetupEmail };

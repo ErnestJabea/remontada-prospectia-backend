@@ -219,6 +219,7 @@ app.use((req, res) => {
 if (require.main === module) {
   const server = app.listen(PORT, API_HOST);
   server.once('listening', () => {
+    require('./utils/notificationDelivery').startDeliveryWorker();
     console.log(`ERP Remontada Prospectia API v${API_VERSION} disponible sur ${API_HOST}:${PORT}`);
   });
   server.once('error', error => {

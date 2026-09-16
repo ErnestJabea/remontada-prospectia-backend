@@ -11,7 +11,9 @@
     "migrate:workflow-integrity": "node migrate_workflow_integrity.js",
     "test:workflows": "node test_workflows_isolated.js",
     "test:live-readonly": "node test_live_readonly.js",
-    "test:analytics": "node --test test_analytics.js"
+    "test:analytics": "node --test test_analytics.js",
+    "migrate:notifications": "node migrate_notifications.js",
+    "migrate:objective-proposal-status": "node migrate_objective_proposal_status.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -27,7 +29,8 @@
     "nodemailer": "^10.0.3",
     "pdfkit": "^0.19.1",
     "qrcode": "^1.5.4",
-    "speakeasy": "^2.0.0"
+    "speakeasy": "^2.0.0",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

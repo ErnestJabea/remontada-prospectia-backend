@@ -5,3 +5,5 @@ node_modules/
 uploads/
 *.log
 last_otp.txt
+
+.npm-cache/

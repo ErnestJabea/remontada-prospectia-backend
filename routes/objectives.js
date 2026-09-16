@@ -487,7 +487,7 @@ async function evaluateObjective(objectiveId, userId = 1) {
   const now = new Date();
   const start = new Date(obj.start_date);
 
-  if (obj.status === 'ASSIGNED' && now >= start) {
+  if (['VALIDATED', 'ASSIGNED'].includes(obj.status) && obj.responsible_id && now >= start) {
     nextWorkflowStatus = 'IN_PROGRESS';
   }
 
@@ -520,7 +520,7 @@ router.get('/', authenticate, async (req, res) => {
   try {
     const { status, period_type, domain_id, responsible_id } = req.query;
     let query = `
-      SELECT o.*, u.full_name as assignee_name, c.full_name as creator_name,
+      SELECT o.*, CASE WHEN EXISTS (SELECT 1 FROM objectif_historiques origin WHERE origin.objective_id=o.id AND origin.action='CREATE_PROPOSAL') THEN 'FIELD' ELSE 'BACKOFFICE' END AS creation_source, u.full_name as assignee_name, c.full_name as creator_name,
              k.name as kpi_name, k.type as kpi_type, k.unit as kpi_unit, d.name as domain_name
       FROM crm_objectives o
       LEFT JOIN users u ON o.responsible_id = u.id
@@ -581,7 +581,7 @@ router.get('/', authenticate, async (req, res) => {
 router.get('/:id', authenticate, async (req, res) => {
   try {
     const [objs] = await pool.query(
-      `SELECT o.*, u.full_name as responsible_name, u.role as responsible_role,
+      `SELECT o.*, CASE WHEN EXISTS (SELECT 1 FROM objectif_historiques origin WHERE origin.objective_id=o.id AND origin.action='CREATE_PROPOSAL') THEN 'FIELD' ELSE 'BACKOFFICE' END AS creation_source, u.full_name as responsible_name, u.role as responsible_role,
               k.name as kpi_name, k.type as kpi_type, k.calculation_source as kpi_source, d.name as domain_name,
               p.title as parent_title
        FROM crm_objectives o
@@ -1042,7 +1042,8 @@ router.post('/:id/validate', authenticate, authorize('DIRECTION'), async (req, r
           creatorId: obj.created_by
         });
       }
-      targetStatus = 'ASSIGNED';
+      const [proposalHistory] = await conn.query("SELECT id FROM objectif_historiques WHERE objective_id=? AND action='CREATE_PROPOSAL' LIMIT 1", [obj.id]);
+      targetStatus = proposalHistory.length ? 'VALIDATED' : 'ASSIGNED';
     }
 
     await conn.query(
@@ -1112,6 +1113,9 @@ router.post('/:id/assign', authenticate, async (req, res) => {
     const [objs] = await conn.query('SELECT * FROM crm_objectives WHERE id = ? FOR UPDATE', [req.params.id]);
     if (!objs.length) return res.status(404).json({ error: 'Objectif introuvable.' });
     const obj = objs[0];
+
+    const [proposalHistory] = await conn.query("SELECT id FROM objectif_historiques WHERE objective_id=? AND action='CREATE_PROPOSAL' LIMIT 1", [obj.id]);
+    if (proposalHistory.length) return res.status(409).json({error:'Un objectif proposé sur le terrain est validé pour son créateur et ne nécessite pas d’affectation.'});
 
     // L'affectation requiert DIRECTION ou d'être le responsable principal
     if (!isObjectiveManager(req.user) && obj.responsible_id !== req.user.id) {

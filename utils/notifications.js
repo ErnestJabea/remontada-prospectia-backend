@@ -16,16 +16,7 @@ async function notifyDirection(title, message, type, targetId = null) {
 
     if (users.length === 0) return;
 
-    // 2. Insérer une notification pour chaque utilisateur
-    const insertPromises = users.map(user => {
-      return pool.query(
-        `INSERT INTO crm_notifications (user_id, title, message, type, target_id)
-         VALUES (?, ?, ?, ?, ?)`,
-        [user.id, title, message, type, targetId]
-      );
-    });
-
-    await Promise.all(insertPromises);
+    await Promise.all(users.map(user => notifyUser(user.id, title, message, type, targetId)));
     console.log(`[NOTIF] Notification de type ${type} envoyée à ${users.length} utilisateurs de la direction.`);
   } catch (err) {
     if (pool.inTransaction()) throw err;
@@ -43,11 +34,14 @@ async function notifyDirection(title, message, type, targetId = null) {
  */
 async function notifyUser(userId, title, message, type, targetId = null) {
   try {
-    await pool.query(
+    const [inserted] = await pool.query(
       `INSERT INTO crm_notifications (user_id, title, message, type, target_id)
        VALUES (?, ?, ?, ?, ?)`,
       [userId, title, message, type, targetId]
     );
+    if (type.startsWith('OBJECTIVE_')) {
+      await pool.query("INSERT INTO notification_deliveries (notification_id,channel) VALUES (?, 'email'), (?, 'push')", [inserted.insertId, inserted.insertId]);
+    }
     console.log(`[NOTIF] Notification de type ${type} envoyée à l'utilisateur ${userId}.`);
   } catch (err) {
     if (pool.inTransaction()) throw err;
