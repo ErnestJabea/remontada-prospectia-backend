@@ -111,7 +111,15 @@ const MISSION_EXTRA_COLUMNS = [
   ['check_in_latitude', 'DECIMAL(10,7) NULL'],
   ['check_in_longitude', 'DECIMAL(10,7) NULL'],
   ['completed_at', 'DATETIME NULL'],
-  ['closed_at', 'DATETIME NULL']
+  ['closed_at', 'DATETIME NULL'],
+  ['base_city_id', 'INT NULL'],
+  ['client_request_id', 'VARCHAR(36) NULL UNIQUE'],
+  ['travel_scope', "ENUM('IN_CITY','OUT_OF_CITY') NULL"],
+  ['departure_at', 'DATETIME NULL'],
+  ['return_at', 'DATETIME NULL'],
+  ['transport_mode', 'VARCHAR(40) NULL'],
+  ['accommodation_required', 'BOOLEAN NOT NULL DEFAULT FALSE'],
+  ['estimated_travel_cost', 'DECIMAL(15,2) NOT NULL DEFAULT 0']
 ];
 let ensureMissionColumnsPromise;
 
@@ -402,11 +410,34 @@ async function ensureMissionColumns() {
       const existing = new Set(rows.map(row => row.COLUMN_NAME));
       for (const [name, definition] of MISSION_EXTRA_COLUMNS) {
         if (!existing.has(name)) {
-          await pool.query(`ALTER TABLE crm_missions ADD COLUMN ${name} ${definition}`);
+          await pool.query(`ALTER TABLE crm_missions ADD COLUMN ${name} ${definition}`).catch(err => {
+            console.warn(`[AUTO_MIGRATE_WARN] crm_missions.${name}:`, err?.message);
+          });
         }
       }
-      await pool.query('ALTER TABLE crm_missions MODIFY COLUMN visit_approach TEXT NULL');
-      await ensureMissionTargetTables(pool);
+      // Verifier la colonne base_city_id sur users
+      const [userCols] = await pool.query(
+        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'base_city_id'`
+      );
+      if (!userCols.length) {
+        await pool.query('ALTER TABLE users ADD COLUMN base_city_id INT NULL AFTER job_description_id').catch(() => {});
+      }
+      // Verifier les colonnes bilingues name_en sur les referentiels
+      for (const refTable of ['crm_ref_regions', 'crm_ref_departments', 'crm_ref_cities']) {
+        const [refCols] = await pool.query(
+          `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'name_en'`,
+          [refTable]
+        );
+        if (!refCols.length) {
+          await pool.query(`ALTER TABLE ${refTable} ADD COLUMN name_en VARCHAR(255) DEFAULT NULL`).catch(() => {});
+        }
+      }
+      await pool.query('ALTER TABLE crm_missions MODIFY COLUMN visit_approach TEXT NULL').catch(() => {});
+      await ensureMissionTargetTables(pool).catch(err => {
+        console.warn('[ENSURE_MISSION_TARGET_TABLES_WARN]', err?.message);
+      });
     })().catch(err => {
       ensureMissionColumnsPromise = null;
       throw err;
