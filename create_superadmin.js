@@ -109,6 +109,8 @@ async function run() {
 👉 Vous pouvez maintenant vous connecter sur le Backoffice avec cet identifiant et votre nouveau mot de passe.
       `);
       process.exit(0);
+    }
+
     if (action === 'promote') {
       const identifier = args[1];
       if (!identifier) {
