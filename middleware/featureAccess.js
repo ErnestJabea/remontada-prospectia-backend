@@ -2,7 +2,9 @@ const pool = require('../db');
 const FEATURES = {objectives:'crm',missions:'crm',institutions:'crm',opportunities:'crm',reports:'crm',users:'admin',referentials:'admin',kpis:'admin',security:'admin'};
 function permissionFor(user,feature) {
   if (user.role === 'SYSTEM' || !user.job_description_id) return null;
-  return user.jobPermissions?.find(p => p.feature_id === feature && p.module_id === FEATURES[feature]) || {};
+  const found = user.jobPermissions?.find(p => p.feature_id === feature && p.module_id === FEATURES[feature]);
+  if (!found && (user.role === 'DIRECTION' || user.role === 'ADMIN')) return null;
+  return found || {};
 }
 function assertFeature(user,feature,operation='can_view') {
   const permission = permissionFor(user,feature);
@@ -23,8 +25,15 @@ const ownership = {
 function requireFeature(defaultFeature) {
   return async (req,res,next) => {
     try {
-      const feature = defaultFeature === 'objectives' && /^\/(domains|kpis)(\/|$)/.test(req.path) ? 'kpis' : defaultFeature;
-      const operation = ['GET','HEAD'].includes(req.method) ? 'can_view' : req.method === 'DELETE' ? 'can_delete' : req.method === 'POST' && (req.path === '/' || req.path === '/proposals' || req.path.startsWith('/generate')) ? 'can_create' : 'can_update';
+      const isDomainOrKpi = defaultFeature === 'objectives' && /^\/(domains|kpis)(\/|$)/.test(req.path);
+      const feature = isDomainOrKpi ? 'kpis' : defaultFeature;
+      const isCreate = req.method === 'POST' && (
+        req.path === '/' ||
+        req.path === '/proposals' ||
+        req.path.startsWith('/generate') ||
+        /^\/(domains|kpis)\/?$/.test(req.path)
+      );
+      const operation = ['GET','HEAD'].includes(req.method) ? 'can_view' : req.method === 'DELETE' ? 'can_delete' : isCreate ? 'can_create' : 'can_update';
       // Objective users need these lookup lists to propose an objective.
       // Editing the catalog still requires the administrative KPI permission.
       const objectiveLookup = defaultFeature === 'objectives' && ['GET','HEAD'].includes(req.method) && /^\/(domains|kpis)\/?$/.test(req.path);
