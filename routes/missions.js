@@ -518,14 +518,23 @@ router.get('/', authenticate, async (req, res) => {
     query += ' ORDER BY m.scheduled_date DESC';
 
     const [rows] = await pool.query(query, params);
-    const targetsByMission = await getMissionTargets(pool, rows.map(row => row.id));
+    let targetsByMission = new Map();
+    try {
+      targetsByMission = await getMissionTargets(pool, rows.map(row => row.id));
+    } catch (targetsErr) {
+      console.warn('[MISSIONS/LIST_TARGETS_WARN]', targetsErr?.message);
+    }
     return res.json(rows.map(row => ({
       ...row,
       targets: targetsByMission.get(Number(row.id)) || []
     })));
   } catch (err) {
     console.error('[MISSIONS/LIST]', err);
-    return res.status(500).json({ error: 'Erreur serveur.' });
+    return res.status(500).json({
+      error: 'Erreur serveur.',
+      message: err.message,
+      code: err.code
+    });
   }
 });
 
