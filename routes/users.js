@@ -59,19 +59,38 @@ function buildPasswordSetupUrl(ticket) {
 router.get('/', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (req, res) => {
   if (req.user.restrictFeatureScope) return res.status(403).json({error:'La consultation des équipes exige le droit de vue globale.'});
   try {
-    const [rows] = await pool.query(
-      `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
-              u.email, u.phone, u.role, u.job_description_id, u.base_city_id,
-              base_city.name AS base_city_name, base_city.name_en AS base_city_name_en, u.is_active,
-              u.is_verified, u.last_login, u.created_at, u.mfa_enabled,
-              jd.title AS job_title, jd.role_category
-       FROM users u
-       LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
-       LEFT JOIN crm_ref_cities base_city ON u.base_city_id = base_city.id
-       WHERE u.role NOT IN ('SYSTEM', 'ADMIN')
-       ORDER BY u.created_at DESC`
-    );
-    return res.json(rows);
+    try {
+      const [rows] = await pool.query(
+        `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
+                u.email, u.phone, u.role, u.job_description_id, u.base_city_id,
+                base_city.name AS base_city_name, base_city.name_en AS base_city_name_en, u.is_active,
+                u.is_verified, u.last_login, u.created_at, u.mfa_enabled,
+                jd.title AS job_title, jd.role_category
+         FROM users u
+         LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
+         LEFT JOIN crm_ref_cities base_city ON u.base_city_id = base_city.id
+         WHERE u.role NOT IN ('SYSTEM', 'ADMIN')
+         ORDER BY u.created_at DESC`
+      );
+      return res.json(rows);
+    } catch (queryErr) {
+      if (queryErr.code === 'ER_BAD_FIELD_ERROR' || queryErr.errno === 1054) {
+        console.warn('[USERS/LIST] base_city_id missing, using fallback query');
+        const [fallbackRows] = await pool.query(
+          `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
+                  u.email, u.phone, u.role, u.job_description_id, NULL AS base_city_id,
+                  NULL AS base_city_name, NULL AS base_city_name_en, u.is_active,
+                  u.is_verified, u.last_login, u.created_at, u.mfa_enabled,
+                  jd.title AS job_title, jd.role_category
+           FROM users u
+           LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
+           WHERE u.role NOT IN ('SYSTEM', 'ADMIN')
+           ORDER BY u.created_at DESC`
+        );
+        return res.json(fallbackRows);
+      }
+      throw queryErr;
+    }
   } catch (err) {
     console.error('[USERS/LIST]', err);
     return res.status(500).json({ error: 'Erreur serveur.' });
@@ -81,18 +100,36 @@ router.get('/', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (
 router.get('/commercials', authenticate, authorize('SYSTEM', 'DIRECTION', 'ADMIN'), async (req, res) => {
   if (req.user.restrictFeatureScope) return res.status(403).json({error:'La consultation des équipes exige le droit de vue globale.'});
   try {
-    const [rows] = await pool.query(
-      `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
-               u.email, u.phone, u.role, u.is_active, u.last_login, u.mfa_enabled,
-               u.base_city_id, base_city.name AS base_city_name, base_city.name_en AS base_city_name_en,
-              jd.title AS job_title
-       FROM users u
-       LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
-       LEFT JOIN crm_ref_cities base_city ON u.base_city_id = base_city.id
-       WHERE u.role = 'COMMERCIAL' AND u.is_active = TRUE
-       ORDER BY u.full_name`
-    );
-    return res.json(rows);
+    try {
+      const [rows] = await pool.query(
+        `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
+                 u.email, u.phone, u.role, u.is_active, u.last_login, u.mfa_enabled,
+                 u.base_city_id, base_city.name AS base_city_name, base_city.name_en AS base_city_name_en,
+                jd.title AS job_title
+         FROM users u
+         LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
+         LEFT JOIN crm_ref_cities base_city ON u.base_city_id = base_city.id
+         WHERE u.role = 'COMMERCIAL' AND u.is_active = TRUE
+         ORDER BY u.full_name`
+      );
+      return res.json(rows);
+    } catch (queryErr) {
+      if (queryErr.code === 'ER_BAD_FIELD_ERROR' || queryErr.errno === 1054) {
+        console.warn('[USERS/COMMERCIALS] base_city_id missing, using fallback query');
+        const [fallbackRows] = await pool.query(
+          `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
+                   u.email, u.phone, u.role, u.is_active, u.last_login, u.mfa_enabled,
+                   NULL AS base_city_id, NULL AS base_city_name, NULL AS base_city_name_en,
+                  jd.title AS job_title
+           FROM users u
+           LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
+           WHERE u.role = 'COMMERCIAL' AND u.is_active = TRUE
+           ORDER BY u.full_name`
+        );
+        return res.json(fallbackRows);
+      }
+      throw queryErr;
+    }
   } catch (err) {
     console.error('[USERS/COMMERCIALS]', err);
     return res.status(500).json({ error: 'Erreur serveur.' });
@@ -119,20 +156,40 @@ router.get('/:id', authenticate, async (req, res) => {
   }
 
   try {
-    const [rows] = await pool.query(
-      `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
-              u.email, u.phone, u.role, u.is_active, u.is_verified,
-               u.last_login, u.created_at, u.avatar_url, u.mfa_enabled,
-               u.base_city_id, base_city.name AS base_city_name, base_city.name_en AS base_city_name_en,
-              jd.id AS job_description_id, jd.title AS job_title, jd.role_category
-       FROM users u
-       LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
-       LEFT JOIN crm_ref_cities base_city ON u.base_city_id = base_city.id
-       WHERE u.id = ?`,
-      [requestedId]
-    );
-    if (!rows.length) return res.status(404).json({ error: 'Utilisateur introuvable.' });
-    return res.json(rows[0]);
+    try {
+      const [rows] = await pool.query(
+        `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
+                u.email, u.phone, u.role, u.is_active, u.is_verified,
+                 u.last_login, u.created_at, u.avatar_url, u.mfa_enabled,
+                 u.base_city_id, base_city.name AS base_city_name, base_city.name_en AS base_city_name_en,
+                jd.id AS job_description_id, jd.title AS job_title, jd.role_category
+         FROM users u
+         LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
+         LEFT JOIN crm_ref_cities base_city ON u.base_city_id = base_city.id
+         WHERE u.id = ?`,
+        [requestedId]
+      );
+      if (!rows.length) return res.status(404).json({ error: 'Utilisateur introuvable.' });
+      return res.json(rows[0]);
+    } catch (queryErr) {
+      if (queryErr.code === 'ER_BAD_FIELD_ERROR' || queryErr.errno === 1054) {
+        console.warn('[USERS/DETAIL] base_city_id missing, using fallback query');
+        const [fallbackRows] = await pool.query(
+          `SELECT u.id, u.username, u.full_name, u.first_name, u.last_name,
+                  u.email, u.phone, u.role, u.is_active, u.is_verified,
+                   u.last_login, u.created_at, u.avatar_url, u.mfa_enabled,
+                   NULL AS base_city_id, NULL AS base_city_name, NULL AS base_city_name_en,
+                  jd.id AS job_description_id, jd.title AS job_title, jd.role_category
+           FROM users u
+           LEFT JOIN job_descriptions jd ON u.job_description_id = jd.id
+           WHERE u.id = ?`,
+          [requestedId]
+        );
+        if (!fallbackRows.length) return res.status(404).json({ error: 'Utilisateur introuvable.' });
+        return res.json(fallbackRows[0]);
+      }
+      throw queryErr;
+    }
   } catch (err) {
     console.error('[USERS/DETAIL]', err);
     return res.status(500).json({ error: 'Erreur serveur.' });

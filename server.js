@@ -220,6 +220,13 @@ if (require.main === module) {
   const server = app.listen(PORT, API_HOST);
   server.once('listening', () => {
     require('./utils/notificationDelivery').startDeliveryWorker();
+    try {
+      require('./migrate_production_fixes').runMigration().catch(err => {
+        console.warn('[AUTO_MIGRATE_WARN]', err?.message);
+      });
+    } catch (e) {
+      console.warn('[AUTO_MIGRATE_ERROR]', e?.message);
+    }
     console.log(`ERP Remontada Prospectia API v${API_VERSION} disponible sur ${API_HOST}:${PORT}`);
   });
   server.once('error', error => {

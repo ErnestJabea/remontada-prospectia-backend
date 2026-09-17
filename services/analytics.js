@@ -49,7 +49,7 @@ function period(query, now = new Date()) {
   const end = query.end ? parse(query.end) : parse(now.toISOString().slice(0,10));
   const start = query.start ? parse(query.start) : new Date(+end - 29*86400000);
   const days = Math.round((end-start)/86400000)+1;
-  if (days < 1 || days > 366 || end > now) throw Object.assign(new Error('Période invalide (1 à 366 jours, sans date future).'), { status: 400 });
+  if (days < 1 || days > 366) throw Object.assign(new Error('Période invalide (1 à 366 jours).'), { status: 400 });
   const format = d => d.toISOString().slice(0,10);
   return { start: format(start), end: format(end), exclusiveEnd: format(new Date(+end+86400000)), previousStart: format(new Date(+start-days*86400000)), days };
 }
@@ -58,13 +58,37 @@ async function cohort(db, name, user, range) {
   const scoped = (name === 'institutions' ? Boolean(permissionFor(user,name) && !permissionFor(user,name).can_view_all) : scopeRestricted(user, name)) && def.scope;
   const where = scoped ? def.scope : '1=1';
   const args = scoped ? Array(def.scopeArgs).fill(user.id) : [];
+
+  const runQuery = async (sqlQuery, sqlArgs) => {
+    try {
+      return await db.query(sqlQuery, sqlArgs);
+    } catch (err) {
+      if (err.code === 'ER_BAD_FIELD_ERROR' || err.errno === 1054) {
+        console.warn(`[ANALYTICS/COHORT] Column fallback for ${name}:`, err.message);
+        const safeSql = sqlQuery
+          .replace(/SUM\(estimated_travel_cost\)/gi, '0')
+          .replace(/estimated_travel_cost/gi, '0')
+          .replace(/x\.travel_scope/gi, "'-'");
+        return await db.query(safeSql, sqlArgs);
+      }
+      throw err;
+    }
+  };
+
   const metrics = def.metrics.map((m,i) => `${m.sql} AS m${i}`).join(',');
-  const read = async (start,end) => (await db.query(`SELECT ${metrics} FROM ${def.from} WHERE ${where} AND x.created_at >= ? AND x.created_at < ?`, [...args,start,end]))[0][0];
+  const read = async (start,end) => (await runQuery(`SELECT ${metrics} FROM ${def.from} WHERE ${where} AND x.created_at >= ? AND x.created_at < ?`, [...args,start,end]))[0][0];
   const current = await read(range.start,range.exclusiveEnd);
   const previous = await read(range.previousStart,range.start);
-  const [[stock]] = await db.query(`SELECT ${metrics} FROM ${def.from} WHERE ${where}`, args);
-  const group = async expression => (await db.query(`SELECT COALESCE(${expression},'-') AS label, COUNT(*) AS value FROM ${def.from} WHERE ${where} AND x.created_at >= ? AND x.created_at < ? GROUP BY label ORDER BY value DESC, label LIMIT 12`, [...args,range.start,range.exclusiveEnd]))[0];
-  const [daily] = await db.query(`SELECT DATE_FORMAT(x.created_at,'%Y-%m-%d') AS day, COUNT(*) AS value FROM ${def.from} WHERE ${where} AND x.created_at >= ? AND x.created_at < ? GROUP BY day ORDER BY day`, [...args,range.start,range.exclusiveEnd]);
+  const [[stock]] = await runQuery(`SELECT ${metrics} FROM ${def.from} WHERE ${where}`, args);
+  const group = async expression => {
+    try {
+      return (await runQuery(`SELECT COALESCE(${expression},'-') AS label, COUNT(*) AS value FROM ${def.from} WHERE ${where} AND x.created_at >= ? AND x.created_at < ? GROUP BY label ORDER BY value DESC, label LIMIT 12`, [...args,range.start,range.exclusiveEnd]))[0];
+    } catch (err) {
+      console.warn(`[ANALYTICS] Grouping fallback for ${expression}:`, err.message);
+      return [];
+    }
+  };
+  const [daily] = await runQuery(`SELECT DATE_FORMAT(x.created_at,'%Y-%m-%d') AS day, COUNT(*) AS value FROM ${def.from} WHERE ${where} AND x.created_at >= ? AND x.created_at < ? GROUP BY day ORDER BY day`, [...args,range.start,range.exclusiveEnd]);
   const byDay = new Map(daily.map(row => [row.day, Number(row.value)]));
   return {
     stockMetrics: def.metrics.map((m,i) => ({ ...m, sql: undefined, value: stock[`m${i}`] === null ? null : Number(stock[`m${i}`]) })),
@@ -102,7 +126,16 @@ async function analytics(db,name,user,range) {
   if (!canRead(name,user)) throw Object.assign(new Error('Accès refusé.'),{status:403});
   if (name === 'dashboard') {
     const sections = {};
-    for (const key of ['objectives','missions','opportunities','reports']) { if (canRead(key,user)) sections[key] = await cohort(db,key,user,range); }
+    for (const key of ['objectives','missions','opportunities','reports']) {
+      if (canRead(key,user)) {
+        try {
+          sections[key] = await cohort(db,key,user,range);
+        } catch (err) {
+          console.error(`[ANALYTICS/DASHBOARD] Cohort for ${key} failed:`, err?.message || err);
+          sections[key] = { stockMetrics: [], mode: 'cohort', metrics: [], groups: [], extraGroups: [], trend: [] };
+        }
+      }
+    }
     return {mode:'dashboard',sections};
   }
   return definitions[name] ? cohort(db,name,user,range) : snapshot(db,name);
