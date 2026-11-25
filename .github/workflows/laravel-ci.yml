@@ -1,0 +1,141 @@
+name: Laravel API CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['laravel/**', '.github/workflows/laravel-*.yml', '.github/actions/laravel-build/**']
+  push:
+    branches: [main]
+    paths: ['laravel/**', '.github/workflows/laravel-*.yml', '.github/actions/laravel-build/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: laravel-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Qualité et sécurité
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: laravel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Aucun secret versionné
+        working-directory: .
+        run: |
+          if git ls-files | grep -E '(^|/)\.env(\.[^/]*)?$' | grep -vE '\.example$'; then
+            echo "::error::Un fichier .env est suivi par Git." && exit 1
+          fi
+          if git ls-files | grep -E 'last_otp\.txt$|\.pem$|id_rsa'; then
+            echo "::error::Fichier sensible suivi par Git." && exit 1
+          fi
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, intl, gd, zip, pdo_mysql, bcmath
+          coverage: none
+          tools: composer:v2
+
+      - name: Cache Composer
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache/files
+          key: composer-${{ hashFiles('laravel/composer.lock') }}
+
+      - run: composer validate --strict
+      - run: composer install --prefer-dist --no-interaction --no-progress
+      - name: Style (Pint)
+        run: vendor/bin/pint --test
+      - name: Syntaxe PHP
+        run: find app bootstrap config routes database tests -name '*.php' -print0 | xargs -0 -n1 php -l > /dev/null
+      - name: Audit des dépendances
+        run: composer audit --no-dev --abandoned=ignore
+
+  tests:
+    name: Tests (PHP ${{ matrix.php }} / ${{ matrix.db }})
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Les hébergements cPanel proposent MySQL 8 ou MariaDB selon l'offre.
+          - { php: '8.3', db: 'mysql:8.0' }
+          - { php: '8.3', db: 'mariadb:10.11' }
+          - { php: '8.4', db: 'mysql:8.0' }
+    services:
+      db:
+        image: ${{ matrix.db }}
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MARIADB_ROOT_PASSWORD: root
+          MYSQL_DATABASE: nexus_crm_test
+          MARIADB_DATABASE: nexus_crm_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot || healthcheck.sh --connect"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    env:
+      APP_ENV: testing
+      DB_CONNECTION: mysql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_DATABASE: nexus_crm_test
+      DB_USERNAME: root
+      DB_PASSWORD: root
+      JWT_SECRET: ci-only-access-secret-0123456789abcdef
+      JWT_REFRESH_SECRET: ci-only-refresh-secret-0123456789abcdef
+      ALLOWED_ORIGINS: http://localhost:5174
+    defaults:
+      run:
+        working-directory: laravel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, intl, gd, zip, pdo_mysql, bcmath
+          coverage: none
+          tools: composer:v2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache/files
+          key: composer-${{ hashFiles('laravel/composer.lock') }}
+      - run: composer install --prefer-dist --no-interaction --no-progress
+      - name: Préparer l'environnement
+        run: |
+          cp .env.example .env
+          php artisan key:generate --force
+      - name: Charger le schéma de référence
+        run: mysql -h 127.0.0.1 -uroot -proot nexus_crm_test < database/schema/baseline-node.sql
+      - name: Routes
+        run: php artisan route:list --path=api > /dev/null
+      - name: Tests
+        run: php artisan test
+
+  build:
+    name: Archive de release
+    needs: tests
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - id: build
+        uses: ./.github/actions/laravel-build
+        with:
+          output: remontada-api-${{ github.sha }}.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remontada-api-${{ github.sha }}
+          path: ${{ steps.build.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 14
