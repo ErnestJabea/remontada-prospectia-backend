@@ -29,7 +29,7 @@ Fichiers : `.github/workflows/laravel-ci.yml`, `.github/workflows/laravel-deploy
 | variable | `CPANEL_APP_DIR` | `remontada-api` (staging : `remontada-api-staging`) |
 | variable | `CPANEL_PHP_BIN` | `/opt/cpanel/ea-php83/root/usr/bin/php` (mode `ssh`) |
 | variable | `CPANEL_SSH_PORT` | `22` (certains hébergeurs : `2222` ou autre) |
-| variable | `HEALTHCHECK_URL` | `https://remontada-api.ippc-cm.com/api/v1/health` |
+| variable | `HEALTHCHECK_URL` | `https://remontada-api-test.ippc-cm.com/api/v1/health` |
 
 Aucun secret applicatif (JWT, base, SMTP, VAPID) n'est stocké dans GitHub : ils vivent uniquement dans le `.env` du serveur.
 
@@ -56,7 +56,19 @@ Aucun secret applicatif (JWT, base, SMTP, VAPID) n'est stocké dans GitHub : ils
    (mode `ftp` : retirer `/current`). Elle envoie les notifications e-mail/push et les rappels de relance.
 5. **Premier déploiement** : Actions → *Laravel API Deploy* → *Run workflow* → `staging`. Vérifier `HEALTHCHECK_URL`.
 
-## 3. Bascule depuis Node.js sans perte de données
+## 3. Adresses de production
+
+| Rôle | URL | Hébergement |
+|---|---|---|
+| Backoffice | `https://bo-remontada.ippc-cm.com` | cPanel |
+| PWA terrain | `https://pwa.ippc-cm.com` | cPanel |
+| API | `https://remontada-api-test.ippc-cm.com` | **à recréer sur cPanel** (pointait vers l'ancien VPS) |
+
+Garder ce nom d'hôte pour l'API : les builds de production des deux frontends (`VITE_API_URL`) et les QR codes des ordres de mission déjà imprimés y renvoient.
+Dans le `.env` : `FRONTEND_ORIGINS=https://bo-remontada.ippc-cm.com,https://pwa.ippc-cm.com`, `BACKOFFICE_PUBLIC_URL=https://bo-remontada.ippc-cm.com`, `MISSION_VERIFICATION_PUBLIC_URL=https://remontada-api-test.ippc-cm.com`.
+Les certificats SSL doivent présenter la **chaîne complète** (certificat + intermédiaires) : cPanel → SSL/TLS Status → AutoSSL, ou installer le « CA bundle » avec le certificat. Une chaîne incomplète bloque les appels de la PWA sur certains mobiles.
+
+## 4. Bascule depuis Node.js sans perte de données
 
 1. Sauvegarde complète de la base (cPanel → Backup ou phpMyAdmin → Exporter) et du dossier `uploads/`.
 2. Vider la file hors-ligne des PWA (demander aux commerciaux de synchroniser) — les reçus de synchronisation créés par Node peuvent ne pas être reconnus par Laravel.
@@ -67,7 +79,7 @@ Aucun secret applicatif (JWT, base, SMTP, VAPID) n'est stocké dans GitHub : ils
 
 `php artisan migrate` n'est **pas** utilisé : le schéma existant est conservé tel quel. Le fichier `database/schema/baseline-node.sql` sert uniquement à créer des bases vides (CI, recette) ; il est volontairement nommé pour que Laravel ne le charge jamais automatiquement sur une base existante.
 
-## 4. Spécificités cPanel prises en compte
+## 5. Spécificités cPanel prises en compte
 
 | Contrainte de l'hébergement mutualisé | Réponse |
 |---|---|
@@ -79,7 +91,7 @@ Aucun secret applicatif (JWT, base, SMTP, VAPID) n'est stocké dans GitHub : ils
 | Déploiement sans SSH | Mode `ftp` : miroir FTPS qui préserve `.env` et `storage/` |
 | PHP 8.3 souvent maximum disponible | Dépendances verrouillées sur la plateforme PHP 8.3 (`config.platform.php`) |
 
-## 5. Amélioration conseillée côté frontends (PR séparées)
+## 6. Amélioration conseillée côté frontends (PR séparées)
 
 Les deux clients (`pwa/src/notificationClient.js`, `backoffice/src/notificationClient.js`) se reconnectent toutes les 5 s. C'est compatible, mais ils peuvent respecter le délai `retry` envoyé par le serveur (20 s par défaut) et diviser la charge par quatre :
 
