@@ -15,8 +15,10 @@ class AppServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        // Contrôle à la réception des requêtes HTTP (comme le démarrage de server.js),
+        // pas en console : composer install / package:discover tournent sans .env.
         foreach (['JWT_SECRET' => 'remontada.jwt.secret', 'JWT_REFRESH_SECRET' => 'remontada.jwt.refresh_secret'] as $name => $key) {
-            if (strlen((string) config($key)) < 32 && ! $this->app->runningUnitTests()) {
+            if (strlen((string) config($key)) < 32 && ! $this->app->runningInConsole()) {
                 throw new RuntimeException("{$name} doit contenir au moins 32 caracteres.");
             }
         }
