@@ -1,0 +1,58 @@
+name: Build Laravel API release
+description: Installe les dépendances de production, précompile routes et vues, et produit une archive prête pour cPanel.
+
+inputs:
+  php-version:
+    description: Version PHP de l'hébergement cible
+    default: '8.3'
+  output:
+    description: Chemin de l'archive produite
+    default: release.tar.gz
+
+outputs:
+  archive:
+    description: Chemin absolu de l'archive
+    value: ${{ steps.pack.outputs.archive }}
+
+runs:
+  using: composite
+  steps:
+    - name: PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ inputs.php-version }}
+        extensions: mbstring, intl, gd, zip, pdo_mysql, bcmath, fileinfo, openssl
+        coverage: none
+        tools: composer:v2
+
+    - name: Dépendances de production
+      shell: bash
+      working-directory: laravel
+      run: composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader --classmap-authoritative
+
+    # Les routes et vues compilées ne contiennent aucun secret ; la configuration
+    # reste lue depuis le .env du serveur (jamais mise en cache dans la CI).
+    - name: Précompilation routes et vues
+      shell: bash
+      working-directory: laravel
+      env:
+        APP_KEY: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        JWT_SECRET: build-only-placeholder-secret-0123456789
+        JWT_REFRESH_SECRET: build-only-placeholder-secret-9876543210
+        DB_CONNECTION: mysql
+        CACHE_STORE: array
+      run: |
+        php artisan route:cache
+        php artisan view:cache
+        rm -f bootstrap/cache/config.php
+
+    - name: Archive
+      id: pack
+      shell: bash
+      run: |
+        tar -czf "${{ inputs.output }}" -C laravel \
+          --exclude='./.env' --exclude='./.env.*' --exclude='./tests' --exclude='./node_modules' \
+          --exclude='./storage/logs/*' --exclude='./storage/framework/cache/data/*' --exclude='./storage/framework/sessions/*' \
+          --exclude='./storage/app/private/*' --exclude='./phpunit.xml' --exclude='./.phpunit.result.cache' .
+        echo "archive=$(pwd)/${{ inputs.output }}" >> "$GITHUB_OUTPUT"
+        ls -lh "${{ inputs.output }}"

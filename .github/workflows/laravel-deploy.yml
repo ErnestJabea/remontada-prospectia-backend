@@ -1,0 +1,119 @@
+name: Laravel API Deploy (cPanel)
+
+# Recette automatique après chaque CI verte sur main ; production uniquement
+# à la main, et protégée par l'environnement GitHub « production »
+# (Settings → Environments → Required reviewers).
+on:
+  workflow_run:
+    workflows: [Laravel API CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environnement cible
+        type: choice
+        options: [staging, production]
+        default: staging
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ inputs.environment || 'staging' }}
+    concurrency:
+      group: deploy-${{ inputs.environment || 'staging' }}
+      cancel-in-progress: false
+    env:
+      # Variables d'environnement GitHub (Settings → Environments → Variables)
+      DEPLOY_METHOD: ${{ vars.DEPLOY_METHOD || 'ftp' }}      # ssh | ftp
+      APP_DIR: ${{ vars.CPANEL_APP_DIR }}                     # ex. remontada-api (relatif au $HOME)
+      PHP_BIN: ${{ vars.CPANEL_PHP_BIN || 'php' }}            # ex. /opt/cpanel/ea-php83/root/usr/bin/php
+      HEALTHCHECK_URL: ${{ vars.HEALTHCHECK_URL }}            # ex. https://api.exemple.cm/api/v1/health
+      HOST: ${{ secrets.CPANEL_HOST }}
+      USER: ${{ secrets.CPANEL_USER }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Contrôle de configuration
+        run: |
+          for v in APP_DIR HOST USER HEALTHCHECK_URL; do
+            [ -n "${!v}" ] || { echo "::error::$v n'est pas configuré pour cet environnement."; exit 1; }
+          done
+
+      - id: build
+        uses: ./.github/actions/laravel-build
+        with:
+          output: release.tar.gz
+
+      # ---------------------------------------------------------------- SSH
+      # Déploiement atomique : releases/<sha> + lien symbolique « current »,
+      # .env et storage partagés, retour arrière automatique si le health check échoue.
+      - name: Clé SSH
+        if: env.DEPLOY_METHOD == 'ssh'
+        run: |
+          install -m 700 -d ~/.ssh
+          echo "${{ secrets.CPANEL_SSH_KEY }}" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "${{ vars.CPANEL_SSH_PORT || 22 }}" -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Déploiement SSH
+        if: env.DEPLOY_METHOD == 'ssh'
+        env:
+          PORT: ${{ vars.CPANEL_SSH_PORT || 22 }}
+          RELEASE: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          SSH="ssh -i ~/.ssh/id_deploy -p $PORT -o BatchMode=yes $USER@$HOST"
+          scp -i ~/.ssh/id_deploy -P "$PORT" release.tar.gz "$USER@$HOST:~/$APP_DIR-release.tar.gz"
+          $SSH bash -se <<EOF
+          set -euo pipefail
+          BASE=~/$APP_DIR; REL=\$BASE/releases/$RELEASE
+          mkdir -p \$BASE/releases \$BASE/shared/storage/{app/private,framework/cache/data,framework/sessions,framework/views,logs}
+          [ -f \$BASE/shared/.env ] || { echo "Créer d'abord \$BASE/shared/.env"; exit 1; }
+          rm -rf \$REL && mkdir -p \$REL && tar -xzf ~/$APP_DIR-release.tar.gz -C \$REL && rm ~/$APP_DIR-release.tar.gz
+          rm -rf \$REL/storage && ln -s \$BASE/shared/storage \$REL/storage && ln -s \$BASE/shared/.env \$REL/.env
+          cd \$REL && $PHP_BIN artisan config:cache && $PHP_BIN artisan about --only=environment > /dev/null
+          PREV=\$(readlink \$BASE/current || true); echo "\$PREV" > \$BASE/.previous
+          ln -sfn \$REL \$BASE/current.tmp && mv -Tf \$BASE/current.tmp \$BASE/current
+          ls -1dt \$BASE/releases/* | tail -n +6 | xargs -r rm -rf
+          EOF
+
+      # ---------------------------------------------------------------- FTP(S)
+      # Pour les offres sans SSH : miroir FTPS. Non atomique : .env et storage/
+      # ne sont jamais écrasés ni supprimés.
+      - name: Déploiement FTPS
+        if: env.DEPLOY_METHOD == 'ftp'
+        env:
+          FTP_PASSWORD: ${{ secrets.CPANEL_FTP_PASSWORD }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq lftp > /dev/null
+          mkdir out && tar -xzf release.tar.gz -C out
+          lftp -u "$USER,$FTP_PASSWORD" "ftp://$HOST" -e "
+            set ftp:ssl-force true; set ftp:ssl-protect-data true; set ssl:verify-certificate yes; set net:max-retries 3;
+            mirror --reverse --delete --parallel=4 --verbose=1 \
+              --exclude-glob .env --exclude-glob storage/ --exclude-glob .htaccess.user \
+              out/ $APP_DIR/;
+            mirror --reverse --only-missing --verbose=1 out/storage/ $APP_DIR/storage/;
+            quit"
+
+      - name: Health check
+        id: health
+        run: |
+          for i in $(seq 1 10); do
+            if curl -fsS --max-time 10 "$HEALTHCHECK_URL" | grep -q '"status":"ok"'; then echo "API opérationnelle."; exit 0; fi
+            sleep 6
+          done
+          echo "::error::Le health check a échoué : $HEALTHCHECK_URL" && exit 1
+
+      - name: Retour arrière (SSH)
+        if: failure() && steps.health.outcome == 'failure' && env.DEPLOY_METHOD == 'ssh'
+        env:
+          PORT: ${{ vars.CPANEL_SSH_PORT || 22 }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -p "$PORT" -o BatchMode=yes "$USER@$HOST" \
+            "PREV=\$(cat ~/$APP_DIR/.previous); [ -n \"\$PREV\" ] && ln -sfn \"\$PREV\" ~/$APP_DIR/current && echo \"Revenu à \$PREV\""
